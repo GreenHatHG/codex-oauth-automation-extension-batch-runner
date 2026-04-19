@@ -247,7 +247,7 @@ def run_pre_run_clash_ai_switch(
                 if normalize_proxy_name(proxy_name)
             }))
             if excluded_names_text:
-                print(f"自动运行前置：内存黑名单跳过节点：{excluded_names_text}。")
+                print(f"自动运行前置：本地黑名单冷却期跳过节点：{excluded_names_text}。")
 
         for proxy_name in available_candidates:
             print(f"自动运行前置：测速 {proxy_name}")

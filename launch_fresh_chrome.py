@@ -6,8 +6,8 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from collections.abc import Sequence
-from dataclasses import dataclass, field
+from collections.abc import Collection, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from chrome_runner.chrome import (
@@ -26,10 +26,25 @@ from chrome_runner.clash import normalize_proxy_name, run_pre_run_clash_ai_switc
 from chrome_runner.constants import (
     ADD_PHONE_ERROR_SIGNAL_TEXTS,
     BASE_PROFILE_DIR_NAME,
+    DEFAULT_PROXY_BLACKLIST_TTL_SECONDS,
+    DEFAULT_PROFILE_BLACKLIST_TTL_SECONDS,
+    PROFILE_BLACKLIST_SIGNAL_TEXTS,
     TARGET_EXTENSION_ID,
 )
 from chrome_runner.extension import ExtensionRunResult, run_extension
-from chrome_runner.profile import parse_profile_name, resolve_profile_dir
+from chrome_runner.profile import (
+    parse_profile_name,
+    profile_uses_2925_mailbox,
+    resolve_profile_dir,
+)
+from chrome_runner.profile_blacklist import (
+    load_active_profile_blacklist_names,
+    record_profile_blacklist_hit,
+)
+from chrome_runner.proxy_blacklist import (
+    load_active_proxy_blacklist_names,
+    record_proxy_blacklist_hit,
+)
 
 CLASH_AI_SWITCH_STRATEGY_ALWAYS = "always"
 CLASH_AI_SWITCH_STRATEGY_REUSE = "reuse"
@@ -73,18 +88,24 @@ class SingleRunResult:
 class BatchProxyState:
     """Batch-level proxy reuse state."""
 
-    proxy_blacklist: set[str] = field(default_factory=set)
     current_proxy_name: str = ""
     current_proxy_run_count: int = 0
+
+
+@dataclass
+class BatchProfileState:
+    """Batch-level profile selection state."""
+
+    next_profile_index: int = 0
 
 
 def parse_positive_int(raw_value: str) -> int:
     try:
         parsed_value = int(raw_value)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("次数必须是正整数。") from exc
+        raise argparse.ArgumentTypeError("参数值必须是正整数。") from exc
     if parsed_value < 1:
-        raise argparse.ArgumentTypeError("次数必须是正整数。")
+        raise argparse.ArgumentTypeError("参数值必须是正整数。")
     return parsed_value
 
 
@@ -128,6 +149,26 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--proxy-blacklist-ttl-seconds",
+        type=parse_positive_int,
+        default=DEFAULT_PROXY_BLACKLIST_TTL_SECONDS,
+        help=(
+            "本地黑名单冷却时长。节点在最近一次命中 add-phone 后，"
+            "达到该秒数前都会被跳过。"
+            f"默认 {DEFAULT_PROXY_BLACKLIST_TTL_SECONDS} 秒。"
+        ),
+    )
+    parser.add_argument(
+        "--profile-blacklist-ttl-seconds",
+        type=parse_positive_int,
+        default=DEFAULT_PROFILE_BLACKLIST_TTL_SECONDS,
+        help=(
+            "本地 profile 黑名单冷却时长。2925 邮箱 profile 命中子账号数量上限通知后，"
+            "达到该秒数前都会被跳过。"
+            f"默认 {DEFAULT_PROFILE_BLACKLIST_TTL_SECONDS} 秒。"
+        ),
+    )
+    parser.add_argument(
         "--run-extension",
         action="store_true",
         help="启动复制出的 Chrome 后，等待扩展执行结束，再自动关闭浏览器并清理运行目录。",
@@ -161,10 +202,6 @@ def resolve_profile_names(args: argparse.Namespace) -> tuple[str, ...]:
     if profile_names:
         return tuple(profile_names)
     return DEFAULT_PROFILE_NAMES
-
-
-def choose_profile_name(profile_names: Sequence[str], attempt_index: int) -> str:
-    return profile_names[(attempt_index - 1) % len(profile_names)]
 
 
 def build_base_profile_dir(base_dir: Path, profile_name: str) -> Path:
@@ -212,28 +249,162 @@ def report_extension_result(result: ExtensionRunResult) -> tuple[int, str]:
     return 1, message
 
 
-def should_blacklist_proxy_for_add_phone(result: ExtensionRunResult) -> bool:
-    if result.outcome != "failure":
-        return False
-    messages = (result.status_text, *result.recent_logs)
+def build_extension_result_messages(result: ExtensionRunResult) -> tuple[str, ...]:
+    return (result.status_text, *result.recent_logs)
+
+
+def has_any_signal_text(messages: Collection[str], signal_texts: Collection[str]) -> bool:
     return any(
         signal_text in message
         for message in messages
-        for signal_text in ADD_PHONE_ERROR_SIGNAL_TEXTS
+        for signal_text in signal_texts
     )
 
 
-def maybe_blacklist_selected_proxy(
-    proxy_blacklist: set[str],
-    result: SingleRunResult,
+def should_blacklist_proxy_for_add_phone(result: ExtensionRunResult) -> bool:
+    if result.outcome != "failure":
+        return False
+    return has_any_signal_text(
+        build_extension_result_messages(result),
+        ADD_PHONE_ERROR_SIGNAL_TEXTS,
+    )
+
+
+def should_blacklist_profile_for_limit_notice(
+    result: ExtensionRunResult,
+    *,
+    uses_2925_mailbox: bool,
+) -> bool:
+    if not uses_2925_mailbox:
+        return False
+    return has_any_signal_text(
+        build_extension_result_messages(result),
+        PROFILE_BLACKLIST_SIGNAL_TEXTS,
+    )
+
+
+def maybe_record_selected_proxy_blacklist(
+    base_dir: Path,
+    *,
+    proxy_name: str,
+    should_blacklist_proxy: bool,
 ) -> None:
-    proxy_name = normalize_proxy_name(result.selected_proxy_name)
-    if not result.should_blacklist_selected_proxy or not proxy_name:
+    proxy_name = normalize_proxy_name(proxy_name)
+    if not should_blacklist_proxy or not proxy_name:
         return
-    if proxy_name in proxy_blacklist:
+    is_new_entry = record_proxy_blacklist_hit(base_dir, proxy_name)
+    if is_new_entry:
+        print(f"自动运行前置：节点已写入本地黑名单：{proxy_name}")
         return
-    proxy_blacklist.add(proxy_name)
-    print(f"自动运行前置：节点已加入内存黑名单，后续轮次跳过：{proxy_name}")
+    print(f"自动运行前置：节点再次命中 add-phone，已刷新本地黑名单时间：{proxy_name}")
+
+
+def maybe_record_profile_blacklist(
+    base_dir: Path,
+    *,
+    profile_name: str,
+    should_blacklist_profile: bool,
+) -> None:
+    if not should_blacklist_profile:
+        return
+    is_new_entry = record_profile_blacklist_hit(base_dir, profile_name)
+    if is_new_entry:
+        print(f"自动运行前置：profile 已写入本地黑名单：{profile_name}")
+        return
+    print(
+        f"自动运行前置：profile 再次命中子账号数量上限通知，"
+        f"已刷新本地黑名单时间：{profile_name}"
+    )
+
+
+def maybe_reset_reused_proxy_for_blacklist(
+    proxy_state: BatchProxyState,
+    active_proxy_blacklist: Collection[str],
+) -> None:
+    current_proxy_name = normalize_proxy_name(proxy_state.current_proxy_name)
+    if not current_proxy_name or current_proxy_name not in active_proxy_blacklist:
+        return
+    print(
+        f"自动运行前置：当前复用节点 {current_proxy_name} 处于本地黑名单冷却期，"
+        "准备切换新节点。"
+    )
+    proxy_state.current_proxy_name = ""
+    proxy_state.current_proxy_run_count = 0
+
+
+def load_active_proxy_blacklist(
+    args: argparse.Namespace,
+    base_dir: Path,
+) -> frozenset[str]:
+    if not should_enable_clash_ai_switch(args):
+        return frozenset()
+    return load_active_proxy_blacklist_names(
+        base_dir,
+        args.proxy_blacklist_ttl_seconds,
+    )
+
+
+def load_active_profile_blacklist(
+    args: argparse.Namespace,
+    base_dir: Path,
+) -> frozenset[str]:
+    return load_active_profile_blacklist_names(
+        base_dir,
+        args.profile_blacklist_ttl_seconds,
+    )
+
+
+def format_profile_names(profile_names: Collection[str]) -> str:
+    seen_profile_names: set[str] = set()
+    ordered_profile_names: list[str] = []
+    for profile_name in profile_names:
+        if profile_name in seen_profile_names:
+            continue
+        seen_profile_names.add(profile_name)
+        ordered_profile_names.append(profile_name)
+    return "、".join(ordered_profile_names)
+
+
+def report_skipped_blacklisted_profiles(
+    profile_names: Sequence[str],
+    active_profile_blacklist: Collection[str],
+) -> None:
+    skipped_profile_names = tuple(
+        profile_name
+        for profile_name in profile_names
+        if profile_name in active_profile_blacklist
+    )
+    if not skipped_profile_names:
+        return
+    skipped_profile_names_text = format_profile_names(skipped_profile_names)
+    print(f"自动运行前置：profile 黑名单冷却期跳过：{skipped_profile_names_text}。")
+
+
+def choose_next_profile_name(
+    profile_names: Sequence[str],
+    active_profile_blacklist: Collection[str],
+    profile_state: BatchProfileState,
+) -> str:
+    total_profile_count = len(profile_names)
+    if total_profile_count == 0:
+        raise RuntimeError("没有可用的 profile。")
+
+    for offset in range(total_profile_count):
+        profile_index = (profile_state.next_profile_index + offset) % total_profile_count
+        profile_name = profile_names[profile_index]
+        if profile_name in active_profile_blacklist:
+            continue
+        profile_state.next_profile_index = (profile_index + 1) % total_profile_count
+        return profile_name
+
+    blacklisted_profile_names_text = format_profile_names(profile_names)
+    if total_profile_count == 1:
+        raise RuntimeError(
+            f"profile {blacklisted_profile_names_text} 处于本地黑名单冷却期。"
+        )
+    raise RuntimeError(
+        f"所有 profile 都处于本地黑名单冷却期：{blacklisted_profile_names_text}"
+    )
 
 
 def should_switch_proxy_for_batch_attempt(
@@ -278,7 +449,6 @@ def update_batch_proxy_state(
 ) -> None:
     proxy_name = normalize_proxy_name(result.selected_proxy_name)
     if result.should_blacklist_selected_proxy:
-        maybe_blacklist_selected_proxy(proxy_state.proxy_blacklist, result)
         proxy_state.current_proxy_name = ""
         proxy_state.current_proxy_run_count = 0
         return
@@ -306,6 +476,8 @@ def execute_single_run(
     exit_code = 0
     summary_text = ""
     cleanup_error: Exception | None = None
+    profile_name = base_profile_dir.name
+    uses_2925_mailbox = profile_uses_2925_mailbox(base_profile_dir)
     if should_switch_proxy is None:
         should_switch_proxy = should_enable_clash_ai_switch(args)
     selected_proxy_name = (
@@ -346,6 +518,20 @@ def execute_single_run(
                 should_blacklist_selected_proxy = (
                     bool(selected_proxy_name)
                     and should_blacklist_proxy_for_add_phone(result)
+                )
+                should_blacklist_profile = should_blacklist_profile_for_limit_notice(
+                    result,
+                    uses_2925_mailbox=uses_2925_mailbox,
+                )
+                maybe_record_selected_proxy_blacklist(
+                    base_dir,
+                    proxy_name=selected_proxy_name,
+                    should_blacklist_proxy=should_blacklist_selected_proxy,
+                )
+                maybe_record_profile_blacklist(
+                    base_dir,
+                    profile_name=profile_name,
+                    should_blacklist_profile=should_blacklist_profile,
                 )
             else:
                 first_message = f"Chrome 已启动，运行配置目录: {runtime_profile_dir}"
@@ -461,13 +647,22 @@ def run_batch(
     results: list[RunAttemptResult] = []
     batch_started_at = time.perf_counter()
     proxy_state = BatchProxyState()
+    profile_state = BatchProfileState()
 
     for attempt_index in range(1, args.repeat_count + 1):
-        profile_name = choose_profile_name(profile_names, attempt_index)
+        active_profile_blacklist = load_active_profile_blacklist(args, base_dir)
+        report_skipped_blacklisted_profiles(profile_names, active_profile_blacklist)
+        profile_name = choose_next_profile_name(
+            profile_names,
+            active_profile_blacklist,
+            profile_state,
+        )
         base_profile_dir = build_base_profile_dir(base_dir, profile_name)
         print(f"第 {attempt_index}/{args.repeat_count} 轮开始")
         print(f"本轮基准 profile: {profile_name}")
         attempt_started_at = time.perf_counter()
+        active_proxy_blacklist = load_active_proxy_blacklist(args, base_dir)
+        maybe_reset_reused_proxy_for_blacklist(proxy_state, active_proxy_blacklist)
         should_switch_proxy = should_switch_proxy_for_batch_attempt(args, proxy_state)
         if not should_switch_proxy:
             maybe_report_reused_proxy_for_batch_attempt(args, proxy_state)
@@ -475,7 +670,7 @@ def run_batch(
             args,
             base_dir,
             base_profile_dir,
-            excluded_proxy_names=frozenset(proxy_state.proxy_blacklist),
+            excluded_proxy_names=active_proxy_blacklist,
             current_proxy_name=proxy_state.current_proxy_name,
             should_switch_proxy=should_switch_proxy,
         )
@@ -507,13 +702,33 @@ def main() -> int:
         return 1
 
     if args.repeat_count > 1:
-        return run_batch(args, base_dir, profile_names)
+        try:
+            return run_batch(args, base_dir, profile_names)
+        except Exception as exc:  # noqa: BLE001
+            print(f"启动失败: {exc}", file=sys.stderr)
+            return 1
 
-    profile_name = choose_profile_name(profile_names, 1)
+    active_profile_blacklist = load_active_profile_blacklist(args, base_dir)
+    report_skipped_blacklisted_profiles(profile_names, active_profile_blacklist)
+    try:
+        profile_name = choose_next_profile_name(
+            profile_names,
+            active_profile_blacklist,
+            BatchProfileState(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"启动失败: {exc}", file=sys.stderr)
+        return 1
     base_profile_dir = build_base_profile_dir(base_dir, profile_name)
     print(f"本轮基准 profile: {profile_name}")
     started_at = time.perf_counter()
-    single_run_result = execute_single_run(args, base_dir, base_profile_dir)
+    active_proxy_blacklist = load_active_proxy_blacklist(args, base_dir)
+    single_run_result = execute_single_run(
+        args,
+        base_dir,
+        base_profile_dir,
+        excluded_proxy_names=active_proxy_blacklist,
+    )
     result = RunAttemptResult(
         index=1,
         exit_code=single_run_result.exit_code,

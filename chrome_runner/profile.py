@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .constants import PROFILE_2925_DOMAIN, PROFILE_PREFERENCES_RELATIVE_PATH
+
 INVALID_PROFILE_NAME_MESSAGE = "profile 名称必须是项目目录下的子目录名。"
 
 
@@ -19,3 +21,18 @@ def parse_profile_name(raw_value: str) -> str:
 
 def resolve_profile_dir(base_dir: Path, profile_name: str) -> Path:
     return base_dir / profile_name
+
+
+def build_profile_preferences_path(profile_dir: Path) -> Path:
+    return profile_dir.joinpath(*PROFILE_PREFERENCES_RELATIVE_PATH)
+
+
+def profile_contains_site_reference(profile_dir: Path, site_reference: str) -> bool:
+    preferences_path = build_profile_preferences_path(profile_dir)
+    if not preferences_path.is_file():
+        return False
+    return site_reference in preferences_path.read_text(encoding="utf-8")
+
+
+def profile_uses_2925_mailbox(profile_dir: Path) -> bool:
+    return profile_contains_site_reference(profile_dir, PROFILE_2925_DOMAIN)
