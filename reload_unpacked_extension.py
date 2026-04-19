@@ -19,15 +19,16 @@ from chrome_runner.chrome import (
 from chrome_runner.constants import DEVTOOLS_READY_TIMEOUT_SECONDS, PAGE_READY_TIMEOUT_SECONDS
 from chrome_runner.devtools import (
     DevToolsClient,
+    close_browser_via_devtools,
     evaluate_javascript,
     fetch_browser_websocket_url,
     wait_for_devtools_ready,
 )
 from chrome_runner.extension import (
-    create_minimized_extension_target,
+    build_extension_page_url,
+    create_extension_target,
     load_json_file,
     read_extension_settings,
-    build_extension_page_url,
 )
 from chrome_runner.profile import parse_profile_name, resolve_profile_dir
 
@@ -166,7 +167,7 @@ def trigger_extension_reload(
         )
         try:
             extension_page_url = build_extension_page_url(profile_dir, extension_id)
-            websocket_url = create_minimized_extension_target(
+            websocket_url = create_extension_target(
                 browser_devtools_client,
                 remote_debugging_port,
                 extension_page_url,
@@ -193,6 +194,10 @@ def trigger_extension_reload(
         finally:
             browser_devtools_client.close()
     finally:
+        try:
+            close_browser_via_devtools(remote_debugging_port)
+        except Exception:
+            pass
         if chrome_process is not None:
             shutdown_chrome_process(chrome_process)
 

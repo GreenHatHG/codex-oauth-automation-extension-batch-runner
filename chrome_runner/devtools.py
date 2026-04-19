@@ -12,8 +12,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Sequence
 
 from .constants import (
+    CHROME_SHUTDOWN_TIMEOUT_SECONDS,
     DEVTOOLS_HOST,
     DEVTOOLS_HTTP_TIMEOUT_SECONDS,
     DEVTOOLS_POLL_INTERVAL_SECONDS,
@@ -207,17 +209,112 @@ def fetch_browser_websocket_url(port: int) -> str:
     return str(websocket_url)
 
 
-def fetch_page_websocket_url(port: int) -> str:
+def close_browser_via_devtools(
+    port: int,
+    timeout_seconds: float = CHROME_SHUTDOWN_TIMEOUT_SECONDS,
+) -> None:
+    websocket_url = fetch_browser_websocket_url(port)
+    client = DevToolsClient(websocket_url, timeout_seconds=timeout_seconds)
+    try:
+        try:
+            client.call("Browser.close")
+        except RuntimeError as exc:
+            if "已关闭" not in str(exc):
+                raise
+    finally:
+        try:
+            client.close()
+        except OSError:
+            pass
+
+
+def _matches_page_target(
+    target: dict[str, object],
+    *,
+    include_url_substring: str = "",
+    excluded_url_prefixes: Sequence[str] = (),
+) -> bool:
+    if target.get("type") != "page" or not target.get("webSocketDebuggerUrl"):
+        return False
+
+    target_url = str(target.get("url", "") or "")
+    if include_url_substring and include_url_substring not in target_url:
+        return False
+    return not any(target_url.startswith(prefix) for prefix in excluded_url_prefixes)
+
+
+def fetch_page_target(
+    port: int,
+    *,
+    include_url_substring: str = "",
+    excluded_url_prefixes: Sequence[str] = (),
+) -> dict[str, object]:
     targets_url = f"http://{DEVTOOLS_HOST}:{port}/json/list"
     targets = fetch_json(targets_url)
     if not isinstance(targets, list):
         raise RuntimeError("Chrome DevTools 返回了非预期的 targets 数据。")
 
     for target in targets:
-        if target.get("type") == "page" and target.get("webSocketDebuggerUrl"):
-            return str(target["webSocketDebuggerUrl"])
+        if not isinstance(target, dict):
+            continue
+        if _matches_page_target(
+            target,
+            include_url_substring=include_url_substring,
+            excluded_url_prefixes=excluded_url_prefixes,
+        ):
+            return target
 
     raise RuntimeError("没有找到可用的 Chrome 页面调试目标。")
+
+
+def fetch_page_websocket_url(
+    port: int,
+    *,
+    include_url_substring: str = "",
+    excluded_url_prefixes: Sequence[str] = (),
+) -> str:
+    target = fetch_page_target(
+        port,
+        include_url_substring=include_url_substring,
+        excluded_url_prefixes=excluded_url_prefixes,
+    )
+    return str(target["webSocketDebuggerUrl"])
+
+
+def wait_for_page_target(
+    port: int,
+    *,
+    include_url_substring: str = "",
+    excluded_url_prefixes: Sequence[str] = (),
+    timeout_seconds: float = DEVTOOLS_TARGET_DISCOVERY_TIMEOUT_SECONDS,
+) -> dict[str, object]:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            return fetch_page_target(
+                port,
+                include_url_substring=include_url_substring,
+                excluded_url_prefixes=excluded_url_prefixes,
+            )
+        except RuntimeError:
+            time.sleep(DEVTOOLS_POLL_INTERVAL_SECONDS)
+    raise TimeoutError("没有在预期时间内找到可填写验证码的页面。")
+
+
+def wait_for_page_websocket_url(
+    port: int,
+    *,
+    include_url_substring: str = "",
+    excluded_url_prefixes: Sequence[str] = (),
+    timeout_seconds: float = DEVTOOLS_TARGET_DISCOVERY_TIMEOUT_SECONDS,
+) -> str:
+    target = wait_for_page_target(
+        port,
+        include_url_substring=include_url_substring,
+        excluded_url_prefixes=excluded_url_prefixes,
+        timeout_seconds=timeout_seconds,
+    )
+    return str(target["webSocketDebuggerUrl"])
 
 
 def wait_for_target_websocket_url(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,6 +71,9 @@ class ExtensionRunResult:
     status_text: str
     timeout_seconds: float = 0.0
     recent_logs: tuple[str, ...] = ()
+
+
+SnapshotObserver = Callable[[ExtensionSnapshot, float | None], None]
 
 
 def load_json_file(file_path: Path) -> dict[str, object]:
@@ -300,16 +304,34 @@ def resolve_operation_timeout_seconds(
     return min(default_timeout_seconds, remaining_seconds)
 
 
+def compute_remaining_attempt_seconds(
+    attempt_started_at: float,
+    max_attempt_seconds: int | None,
+) -> float | None:
+    if max_attempt_seconds is None:
+        return None
+    return max(max_attempt_seconds - (time.monotonic() - attempt_started_at), 0.0)
+
+
 def monitor_extension_run(
     devtools_client: DevToolsClient,
     *,
     attempt_started_at: float,
     max_attempt_seconds: int | None = None,
+    snapshot_observer: SnapshotObserver | None = None,
 ) -> ExtensionRunResult:
     snapshot = capture_extension_snapshot(devtools_client)
     last_snapshot = snapshot
     last_change_at = time.time()
     last_reported_status = ""
+    if snapshot_observer is not None:
+        snapshot_observer(
+            snapshot,
+            compute_remaining_attempt_seconds(
+                attempt_started_at,
+                max_attempt_seconds,
+            ),
+        )
 
     if snapshot.status_text:
         print(f"扩展状态：{snapshot.status_text}")
@@ -348,24 +370,36 @@ def monitor_extension_run(
         if snapshot.fingerprint != last_snapshot.fingerprint:
             last_snapshot = snapshot
             last_change_at = time.time()
+            if snapshot_observer is not None:
+                snapshot_observer(
+                    snapshot,
+                    compute_remaining_attempt_seconds(
+                        attempt_started_at,
+                        max_attempt_seconds,
+                    ),
+                )
             if snapshot.status_text and snapshot.status_text != last_reported_status:
                 print(f"扩展状态：{snapshot.status_text}")
                 last_reported_status = snapshot.status_text
 
 
-def create_minimized_extension_target(
+def create_extension_target(
     browser_devtools_client: DevToolsClient,
     devtools_port: int,
     extension_url: str,
+    *,
+    auto_minimize: bool = True,
     timeout_seconds: float = DEVTOOLS_READY_TIMEOUT_SECONDS,
 ) -> str:
+    target_params: dict[str, object] = {
+        "url": extension_url,
+        "newWindow": True,
+    }
+    if auto_minimize:
+        target_params["windowState"] = "minimized"
     response = browser_devtools_client.call(
         "Target.createTarget",
-        {
-            "url": extension_url,
-            "newWindow": True,
-            "windowState": "minimized",
-        },
+        target_params,
     )
     if response.get("error"):
         raise RuntimeError(f"创建扩展目标页失败: {response['error']}")
@@ -385,7 +419,9 @@ def run_extension(
     devtools_port: int,
     extension_id: str,
     *,
+    auto_minimize: bool = True,
     max_attempt_seconds: int | None = None,
+    snapshot_observer: SnapshotObserver | None = None,
 ) -> ExtensionRunResult:
     attempt_started_at = time.monotonic()
     extension_url = build_extension_page_url(profile_dir, extension_id)
@@ -408,10 +444,11 @@ def run_extension(
             ),
         )
         try:
-            websocket_url = create_minimized_extension_target(
+            websocket_url = create_extension_target(
                 browser_devtools_client,
                 devtools_port,
                 extension_url,
+                auto_minimize=auto_minimize,
                 timeout_seconds=resolve_operation_timeout_seconds(
                     attempt_started_at,
                     max_attempt_seconds,
@@ -453,6 +490,7 @@ def run_extension(
                 devtools_client,
                 attempt_started_at=attempt_started_at,
                 max_attempt_seconds=max_attempt_seconds,
+                snapshot_observer=snapshot_observer,
             )
         finally:
             devtools_client.close()

@@ -14,23 +14,25 @@ from chrome_runner.chrome import (
     build_command,
     build_runtime_profile_dir,
     copy_profile_directory,
-    create_profile_directory,
     delete_profile_directory,
     ensure_chrome_exists,
     find_free_port,
     launch_chrome,
     shutdown_chrome_process,
-    wait_for_chrome_exit,
 )
 from chrome_runner.clash import normalize_proxy_name, run_pre_run_clash_ai_switch
 from chrome_runner.constants import (
     ADD_PHONE_ERROR_SIGNAL_TEXTS,
     BASE_PROFILE_DIR_NAME,
+    DEFAULT_SMS_CODE_REGEX,
+    DEFAULT_SMS_CODE_TIMEOUT_SECONDS,
     DEFAULT_PROXY_BLACKLIST_TTL_SECONDS,
     DEFAULT_PROFILE_BLACKLIST_TTL_SECONDS,
+    DEFAULT_SMS_SOCKET_HOST,
     PROFILE_BLACKLIST_SIGNAL_TEXTS,
     TARGET_EXTENSION_ID,
 )
+from chrome_runner.devtools import close_browser_via_devtools
 from chrome_runner.extension import ExtensionRunResult, run_extension
 from chrome_runner.profile import (
     parse_profile_name,
@@ -47,10 +49,12 @@ from chrome_runner.proxy_blacklist import (
 )
 from chrome_runner.proxy_stats import (
     ProxyStatsEntry,
-    list_active_proxy_cooldown_names,
     load_proxy_stats_entries,
-    record_proxy_run_result,
-    record_proxy_selection,
+    record_proxy_success,
+)
+from chrome_runner.sms_verification import (
+    SmsCodeAutomation,
+    SmsCodeAutomationConfig,
 )
 
 CLASH_AI_SWITCH_STRATEGY_ALWAYS = "always"
@@ -61,6 +65,23 @@ CLASH_AI_SWITCH_STRATEGY_CHOICES = (
 )
 DEFAULT_CLASH_AI_SWITCH_REUSE_LIMIT = 5
 DEFAULT_PROFILE_NAMES = (BASE_PROFILE_DIR_NAME,)
+MANUAL_PRE_RUN_CANCEL_INPUTS = frozenset({"q", "quit", "exit"})
+MANUAL_PRE_RUN_PROMPT = (
+    "请在当前 Chrome 完成前置操作，完成后按回车继续自动运行，"
+    "输入 q 后回车取消本轮："
+)
+MANUAL_PRE_RUN_NOTICE = "自动运行前置：请在当前 Chrome 完成手动操作。"
+MANUAL_PRE_RUN_RESUME_NOTICE = "自动运行前置：收到继续指令，开始执行扩展。"
+MANUAL_PRE_RUN_CANCEL_MESSAGE = "已取消本轮自动运行。"
+MANUAL_PRE_RUN_STDIN_ERROR = "当前运行需要交互式终端，无法读取继续指令。"
+AUTO_MINIMIZE_DISABLED_HELP = (
+    "自动运行时保持 Chrome 和扩展窗口可见。"
+    "默认会自动最小化。仅对 --run-extension 生效。"
+)
+INTERRUPTED_EXIT_CODE = 130
+INTERRUPTED_MESSAGE = "已中断当前运行。"
+INIT_PROFILE_SCRIPT_NAME = "init_chrome_profile.py"
+MISSING_PROFILE_MESSAGE = "缺少基准 profile 目录"
 
 
 @dataclass(frozen=True)
@@ -112,7 +133,6 @@ class ProxySelectionState:
     """Current proxy filtering and priority state."""
 
     blacklisted_proxy_names: frozenset[str] = frozenset()
-    cooling_proxy_names: frozenset[str] = frozenset()
     stats_entries: dict[str, ProxyStatsEntry] = field(default_factory=dict)
 
 
@@ -153,7 +173,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Clash AI 分组节点切换策略。"
             f"{CLASH_AI_SWITCH_STRATEGY_ALWAYS} 表示每轮切换，"
-            f"{CLASH_AI_SWITCH_STRATEGY_REUSE} 表示复用当前节点直到达到上限或命中 addphone。"
+            f"{CLASH_AI_SWITCH_STRATEGY_REUSE} 表示成功时继续复用当前节点，"
+            "直到达到上限或命中 add-phone。"
         ),
     )
     parser.add_argument(
@@ -170,7 +191,7 @@ def parse_args() -> argparse.Namespace:
         type=parse_positive_int,
         default=DEFAULT_PROXY_BLACKLIST_TTL_SECONDS,
         help=(
-            "本地节点冷却时长。节点在最近一次命中 add-phone 或完整流程失败后，"
+            "本地节点黑名单冷却时长。节点命中 add-phone 后，"
             "达到该秒数前都会被跳过。"
             f"默认 {DEFAULT_PROXY_BLACKLIST_TTL_SECONDS} 秒。"
         ),
@@ -189,6 +210,19 @@ def parse_args() -> argparse.Namespace:
         "--run-extension",
         action="store_true",
         help="启动复制出的 Chrome 后，等待扩展执行结束，再自动关闭浏览器并清理运行目录。",
+    )
+    parser.add_argument(
+        "--no-auto-minimize",
+        action="store_true",
+        help=AUTO_MINIMIZE_DISABLED_HELP,
+    )
+    parser.add_argument(
+        "--pause-before-run-extension",
+        action="store_true",
+        help=(
+            "启动复制出的 Chrome 后暂停，等待手动完成前置操作，"
+            "回车后再继续扩展自动运行。需要搭配 --run-extension。"
+        ),
     )
     parser.add_argument(
         "--extension-id",
@@ -210,6 +244,41 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="按顺序重复执行指定次数。大于 1 时需要搭配 --run-extension。",
     )
+    parser.add_argument(
+        "--sms-socket-host",
+        default=DEFAULT_SMS_SOCKET_HOST,
+        help="本地短信接收 socket 的监听地址。",
+    )
+    parser.add_argument(
+        "--sms-socket-port",
+        type=parse_positive_int,
+        default=None,
+        help="本地短信接收 socket 的监听端口。设置后会在验证码日志出现时等待短信并自动填码。",
+    )
+    parser.add_argument(
+        "--sms-code-timeout-seconds",
+        type=parse_positive_int,
+        default=DEFAULT_SMS_CODE_TIMEOUT_SECONDS,
+        help=(
+            "检测到验证码等待日志后，最多等待短信验证码的时长。"
+            f"默认 {DEFAULT_SMS_CODE_TIMEOUT_SECONDS} 秒。"
+        ),
+    )
+    parser.add_argument(
+        "--sms-code-regex",
+        default=DEFAULT_SMS_CODE_REGEX,
+        help="从短信正文里提取验证码时使用的正则，要求第 1 个捕获组为验证码。",
+    )
+    parser.add_argument(
+        "--sms-code-input-selector",
+        default="",
+        help="验证码输入框 CSS selector。留空时使用内置规则查找。",
+    )
+    parser.add_argument(
+        "--sms-code-submit-selector",
+        default="",
+        help="验证码提交按钮 CSS selector。留空时按按钮文案自动查找。",
+    )
     return parser.parse_args()
 
 
@@ -223,6 +292,14 @@ def should_enable_clash_ai_switch(args: argparse.Namespace) -> bool:
     return bool(resolve_clash_ai_switch_strategy(args))
 
 
+def should_auto_minimize(args: argparse.Namespace) -> bool:
+    return bool(args.run_extension and not getattr(args, "no_auto_minimize", False))
+
+
+def should_enable_sms_code_flow(args: argparse.Namespace) -> bool:
+    return getattr(args, "sms_socket_port", None) is not None
+
+
 def resolve_profile_names(args: argparse.Namespace) -> tuple[str, ...]:
     profile_names = getattr(args, "profile", None)
     if profile_names:
@@ -232,6 +309,15 @@ def resolve_profile_names(args: argparse.Namespace) -> tuple[str, ...]:
 
 def build_base_profile_dir(base_dir: Path, profile_name: str) -> Path:
     return resolve_profile_dir(base_dir, profile_name)
+
+
+def build_init_profile_command(profile_name: str) -> str:
+    return f"python3 {INIT_PROFILE_SCRIPT_NAME} --profile {profile_name}"
+
+
+def build_missing_profile_error(profile_dir: Path) -> str:
+    init_command = build_init_profile_command(profile_dir.name)
+    return f"{MISSING_PROFILE_MESSAGE}: {profile_dir}。请先运行：{init_command}"
 
 
 def collect_missing_profile_dirs(
@@ -367,21 +453,6 @@ def maybe_reset_reused_proxy_for_blacklist(
     proxy_state.current_proxy_run_count = 0
 
 
-def maybe_reset_reused_proxy_for_cooldown(
-    proxy_state: BatchProxyState,
-    cooling_proxy_names: Collection[str],
-) -> None:
-    current_proxy_name = normalize_proxy_name(proxy_state.current_proxy_name)
-    if not current_proxy_name or current_proxy_name not in cooling_proxy_names:
-        return
-    print(
-        f"自动运行前置：当前复用节点 {current_proxy_name} 处于失败冷却期，"
-        "准备切换新节点。"
-    )
-    proxy_state.current_proxy_name = ""
-    proxy_state.current_proxy_run_count = 0
-
-
 def load_active_proxy_blacklist(
     args: argparse.Namespace,
     base_dir: Path,
@@ -404,13 +475,8 @@ def load_proxy_selection_state(
             blacklisted_proxy_names=active_proxy_blacklist,
         )
     proxy_stats_entries = load_proxy_stats_entries(base_dir)
-    active_proxy_cooldown = list_active_proxy_cooldown_names(
-        proxy_stats_entries,
-        args.proxy_blacklist_ttl_seconds,
-    )
     return ProxySelectionState(
         blacklisted_proxy_names=active_proxy_blacklist,
-        cooling_proxy_names=active_proxy_cooldown,
         stats_entries=proxy_stats_entries,
     )
 
@@ -519,7 +585,7 @@ def update_batch_proxy_state(
     result: SingleRunResult,
 ) -> None:
     proxy_name = normalize_proxy_name(result.selected_proxy_name)
-    if result.should_blacklist_selected_proxy:
+    if result.should_blacklist_selected_proxy or not result.succeeded:
         proxy_state.current_proxy_name = ""
         proxy_state.current_proxy_run_count = 0
         return
@@ -532,36 +598,15 @@ def update_batch_proxy_state(
     proxy_state.current_proxy_run_count = 1
 
 
-def maybe_record_selected_proxy_stats(
+def maybe_record_selected_proxy_success(
     base_dir: Path,
     *,
     proxy_name: str,
-    delay_ms: int | None = None,
 ) -> None:
     proxy_name = normalize_proxy_name(proxy_name)
     if not proxy_name:
         return
-    record_proxy_selection(
-        base_dir,
-        proxy_name,
-        delay_ms=delay_ms,
-    )
-
-
-def maybe_record_selected_proxy_outcome(
-    base_dir: Path,
-    *,
-    proxy_name: str,
-    succeeded: bool,
-) -> None:
-    proxy_name = normalize_proxy_name(proxy_name)
-    if not proxy_name:
-        return
-    record_proxy_run_result(
-        base_dir,
-        proxy_name,
-        succeeded=succeeded,
-    )
+    record_proxy_success(base_dir, proxy_name)
 
 
 def parse_selected_proxy_delay(raw_value: object) -> int | None:
@@ -570,18 +615,67 @@ def parse_selected_proxy_delay(raw_value: object) -> int | None:
     return None
 
 
+def build_sms_code_automation(
+    args: argparse.Namespace,
+    *,
+    devtools_port: int,
+) -> SmsCodeAutomation | None:
+    if not should_enable_sms_code_flow(args):
+        return None
+    config = SmsCodeAutomationConfig(
+        socket_host=args.sms_socket_host,
+        socket_port=args.sms_socket_port,
+        code_timeout_seconds=args.sms_code_timeout_seconds,
+        code_regex=args.sms_code_regex,
+        input_selector=args.sms_code_input_selector,
+        submit_selector=args.sms_code_submit_selector,
+    )
+    return SmsCodeAutomation(
+        devtools_port=devtools_port,
+        extension_id=args.extension_id,
+        config=config,
+    )
+
+
+def report_runtime_profile_paths(
+    runtime_profile_dir: Path,
+    base_profile_dir: Path,
+) -> str:
+    first_message = f"Chrome 已启动，运行配置目录: {runtime_profile_dir}"
+    second_message = f"基准配置目录: {base_profile_dir}"
+    print(first_message)
+    print(second_message)
+    return f"{first_message}；{second_message}"
+
+
+def wait_for_manual_pre_run_confirmation(
+    runtime_profile_dir: Path,
+    base_profile_dir: Path,
+) -> None:
+    report_runtime_profile_paths(runtime_profile_dir, base_profile_dir)
+    print(MANUAL_PRE_RUN_NOTICE)
+    try:
+        user_input = input(MANUAL_PRE_RUN_PROMPT).strip().lower()
+    except EOFError as exc:
+        raise RuntimeError(MANUAL_PRE_RUN_STDIN_ERROR) from exc
+    if user_input in MANUAL_PRE_RUN_CANCEL_INPUTS:
+        raise RuntimeError(MANUAL_PRE_RUN_CANCEL_MESSAGE)
+    print(MANUAL_PRE_RUN_RESUME_NOTICE)
+
+
 def execute_single_run(
     args: argparse.Namespace,
     base_dir: Path,
     base_profile_dir: Path,
     *,
     excluded_proxy_names: frozenset[str] = frozenset(),
-    cooling_proxy_names: frozenset[str] = frozenset(),
     proxy_stats_entries: dict[str, ProxyStatsEntry] | None = None,
     current_proxy_name: str = "",
     should_switch_proxy: bool | None = None,
 ) -> SingleRunResult:
     chrome_process = None
+    sms_code_automation: SmsCodeAutomation | None = None
+    remote_debugging_port: int | None = None
     runtime_profile_dir: Path | None = None
     should_cleanup_runtime_dir = False
     exit_code = 0
@@ -598,14 +692,13 @@ def execute_single_run(
     )
     selected_proxy_delay_ms: int | None = None
     should_blacklist_selected_proxy = False
-    should_record_proxy_outcome = False
-    proxy_outcome_recorded = False
 
     try:
+        if not base_profile_dir.is_dir():
+            raise RuntimeError(build_missing_profile_error(base_profile_dir))
         if should_switch_proxy:
             switch_result = run_pre_run_clash_ai_switch(
                 excluded_proxy_names=excluded_proxy_names,
-                cooling_proxy_names=cooling_proxy_names,
                 proxy_stats_entries=proxy_stats_entries,
             )
             selected_proxy_name = normalize_proxy_name(switch_result.get("proxy_name"))
@@ -613,96 +706,90 @@ def execute_single_run(
                 switch_result.get("delay")
             )
 
-        if selected_proxy_name:
-            maybe_record_selected_proxy_stats(
-                base_dir,
-                proxy_name=selected_proxy_name,
-                delay_ms=selected_proxy_delay_ms,
-            )
-            should_record_proxy_outcome = args.run_extension
-
         ensure_chrome_exists()
-        if base_profile_dir.exists():
-            runtime_profile_dir = build_runtime_profile_dir(base_dir)
-            copy_profile_directory(base_profile_dir, runtime_profile_dir)
-            remote_debugging_port = find_free_port() if args.run_extension else None
-            chrome_process = launch_chrome(
-                build_command(
+        runtime_profile_dir = build_runtime_profile_dir(base_dir)
+        copy_profile_directory(base_profile_dir, runtime_profile_dir)
+        remote_debugging_port = find_free_port() if args.run_extension else None
+        if args.run_extension and remote_debugging_port is not None:
+            sms_code_automation = build_sms_code_automation(
+                args,
+                devtools_port=remote_debugging_port,
+            )
+            if sms_code_automation is not None:
+                sms_code_automation.start()
+        chrome_process = launch_chrome(
+            build_command(
+                runtime_profile_dir,
+                remote_debugging_port=remote_debugging_port,
+                suppress_startup_window=(
+                    should_auto_minimize(args)
+                    and not args.pause_before_run_extension
+                ),
+            ),
+        )
+
+        if args.run_extension and remote_debugging_port is not None:
+            should_cleanup_runtime_dir = True
+            if args.pause_before_run_extension:
+                wait_for_manual_pre_run_confirmation(
                     runtime_profile_dir,
-                    remote_debugging_port=remote_debugging_port,
-                    suppress_startup_window=args.run_extension,
+                    base_profile_dir,
+                )
+            result = run_extension(
+                runtime_profile_dir,
+                remote_debugging_port,
+                args.extension_id,
+                auto_minimize=should_auto_minimize(args),
+                max_attempt_seconds=args.max_attempt_seconds,
+                snapshot_observer=(
+                    sms_code_automation.maybe_handle_snapshot
+                    if sms_code_automation is not None
+                    else None
                 ),
             )
-
-            if args.run_extension and remote_debugging_port is not None:
-                should_cleanup_runtime_dir = True
-                result = run_extension(
-                    runtime_profile_dir,
-                    remote_debugging_port,
-                    args.extension_id,
-                    max_attempt_seconds=args.max_attempt_seconds,
-                )
-                exit_code, summary_text = report_extension_result(result)
-                if should_record_proxy_outcome:
-                    maybe_record_selected_proxy_outcome(
-                        base_dir,
-                        proxy_name=selected_proxy_name,
-                        succeeded=result.outcome == "success",
-                    )
-                    proxy_outcome_recorded = True
-                should_blacklist_selected_proxy = (
-                    bool(selected_proxy_name)
-                    and should_blacklist_proxy_for_add_phone(result)
-                )
-                should_blacklist_profile = should_blacklist_profile_for_limit_notice(
-                    result,
-                    uses_2925_mailbox=uses_2925_mailbox,
-                )
-                maybe_record_selected_proxy_blacklist(
+            exit_code, summary_text = report_extension_result(result)
+            should_blacklist_selected_proxy = (
+                bool(selected_proxy_name)
+                and should_blacklist_proxy_for_add_phone(result)
+            )
+            if result.outcome == "success":
+                maybe_record_selected_proxy_success(
                     base_dir,
                     proxy_name=selected_proxy_name,
-                    should_blacklist_proxy=should_blacklist_selected_proxy,
                 )
-                maybe_record_profile_blacklist(
-                    base_dir,
-                    profile_name=profile_name,
-                    should_blacklist_profile=should_blacklist_profile,
-                )
-            else:
-                first_message = f"Chrome 已启动，运行配置目录: {runtime_profile_dir}"
-                second_message = f"基准配置目录: {base_profile_dir}"
-                print(first_message)
-                print(second_message)
-                summary_text = f"{first_message}；{second_message}"
-        else:
-            create_profile_directory(base_profile_dir)
-            print("未找到基准配置目录，已启动全新 Chrome。")
-            print("请在打开的浏览器中完成操作，完成后关闭浏览器。")
-            chrome_process = launch_chrome(build_command(base_profile_dir))
-            exit_code = wait_for_chrome_exit(chrome_process)
-            if exit_code != 0:
-                raise RuntimeError(f"Chrome 退出码异常: {exit_code}")
-
-            summary_text = f"基准配置已保存: {base_profile_dir}"
-            print(summary_text)
-            if args.run_extension:
-                note = "当前是基准配置初始化流程。下次运行时再加 --run-extension。"
-                print(note)
-                summary_text = f"{summary_text}；{note}"
-    except Exception as exc:  # noqa: BLE001
-        summary_text = f"启动失败: {exc}"
-        if should_record_proxy_outcome and not proxy_outcome_recorded:
-            maybe_record_selected_proxy_outcome(
+            should_blacklist_profile = should_blacklist_profile_for_limit_notice(
+                result,
+                uses_2925_mailbox=uses_2925_mailbox,
+            )
+            maybe_record_selected_proxy_blacklist(
                 base_dir,
                 proxy_name=selected_proxy_name,
-                succeeded=False,
+                should_blacklist_proxy=should_blacklist_selected_proxy,
             )
-            proxy_outcome_recorded = True
+            maybe_record_profile_blacklist(
+                base_dir,
+                profile_name=profile_name,
+                should_blacklist_profile=should_blacklist_profile,
+            )
+        else:
+            summary_text = report_runtime_profile_paths(
+                runtime_profile_dir,
+                base_profile_dir,
+            )
+    except Exception as exc:  # noqa: BLE001
+        summary_text = f"启动失败: {exc}"
         print(summary_text, file=sys.stderr)
         exit_code = 1
     finally:
+        if sms_code_automation is not None:
+            sms_code_automation.close()
         if should_cleanup_runtime_dir and runtime_profile_dir is not None:
             try:
+                if remote_debugging_port is not None:
+                    try:
+                        close_browser_via_devtools(remote_debugging_port)
+                    except Exception:
+                        pass
                 if chrome_process is not None:
                     shutdown_chrome_process(chrome_process)
                 delete_profile_directory(runtime_profile_dir)
@@ -736,6 +823,10 @@ def validate_batch_args(
         raise RuntimeError(
             "--pre-run-clash-ai-switch 和 --clash-ai-switch-strategy 不能同时使用。"
         )
+    if args.pause_before_run_extension and not args.run_extension:
+        raise RuntimeError("--pause-before-run-extension 需要搭配 --run-extension。")
+    if should_enable_sms_code_flow(args) and not args.run_extension:
+        raise RuntimeError("--sms-socket-port 需要搭配 --run-extension。")
     if args.max_attempt_seconds is not None and not args.run_extension:
         raise RuntimeError("--max-attempt-seconds 需要搭配 --run-extension。")
     if args.repeat_count == 1:
@@ -744,8 +835,10 @@ def validate_batch_args(
         raise RuntimeError("多次运行模式需要搭配 --run-extension。")
     missing_profile_dirs = collect_missing_profile_dirs(base_dir, profile_names)
     if missing_profile_dirs:
-        missing_dirs_text = "、".join(str(path) for path in missing_profile_dirs)
-        raise RuntimeError(f"多次运行模式缺少 profile 目录：{missing_dirs_text}")
+        missing_profile_error_text = "；".join(
+            build_missing_profile_error(path) for path in missing_profile_dirs
+        )
+        raise RuntimeError(missing_profile_error_text)
 
 
 def format_duration(duration_seconds: float) -> str:
@@ -811,10 +904,6 @@ def run_batch(
             proxy_state,
             proxy_selection_state.blacklisted_proxy_names,
         )
-        maybe_reset_reused_proxy_for_cooldown(
-            proxy_state,
-            proxy_selection_state.cooling_proxy_names,
-        )
         should_switch_proxy = should_switch_proxy_for_batch_attempt(args, proxy_state)
         if not should_switch_proxy:
             maybe_report_reused_proxy_for_batch_attempt(args, proxy_state)
@@ -823,7 +912,6 @@ def run_batch(
             base_dir,
             base_profile_dir,
             excluded_proxy_names=proxy_selection_state.blacklisted_proxy_names,
-            cooling_proxy_names=proxy_selection_state.cooling_proxy_names,
             proxy_stats_entries=proxy_selection_state.stats_entries,
             current_proxy_name=proxy_state.current_proxy_name,
             should_switch_proxy=should_switch_proxy,
@@ -858,6 +946,9 @@ def main() -> int:
     if args.repeat_count > 1:
         try:
             return run_batch(args, base_dir, profile_names)
+        except KeyboardInterrupt:
+            print(INTERRUPTED_MESSAGE, file=sys.stderr)
+            return INTERRUPTED_EXIT_CODE
         except Exception as exc:  # noqa: BLE001
             print(f"启动失败: {exc}", file=sys.stderr)
             return 1
@@ -874,17 +965,26 @@ def main() -> int:
         print(f"启动失败: {exc}", file=sys.stderr)
         return 1
     base_profile_dir = build_base_profile_dir(base_dir, profile_name)
+    if not base_profile_dir.is_dir():
+        print(
+            f"启动失败: {build_missing_profile_error(base_profile_dir)}",
+            file=sys.stderr,
+        )
+        return 1
     print(f"本轮基准 profile: {profile_name}")
     started_at = time.perf_counter()
     proxy_selection_state = load_proxy_selection_state(args, base_dir)
-    single_run_result = execute_single_run(
-        args,
-        base_dir,
-        base_profile_dir,
-        excluded_proxy_names=proxy_selection_state.blacklisted_proxy_names,
-        cooling_proxy_names=proxy_selection_state.cooling_proxy_names,
-        proxy_stats_entries=proxy_selection_state.stats_entries,
-    )
+    try:
+        single_run_result = execute_single_run(
+            args,
+            base_dir,
+            base_profile_dir,
+            excluded_proxy_names=proxy_selection_state.blacklisted_proxy_names,
+            proxy_stats_entries=proxy_selection_state.stats_entries,
+        )
+    except KeyboardInterrupt:
+        print(INTERRUPTED_MESSAGE, file=sys.stderr)
+        return INTERRUPTED_EXIT_CODE
     result = RunAttemptResult(
         index=1,
         exit_code=single_run_result.exit_code,

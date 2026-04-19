@@ -169,7 +169,6 @@ def build_available_proxy_candidates(
     *,
     current_proxy_name: str,
     excluded_proxy_names: Collection[str] = (),
-    cooling_proxy_names: Collection[str] = (),
     proxy_stats_entries: Mapping[str, ProxyStatsEntry] | None = None,
 ) -> list[str]:
     excluded_names = {
@@ -177,19 +176,10 @@ def build_available_proxy_candidates(
         for proxy_name in excluded_proxy_names
         if normalize_proxy_name(proxy_name)
     }
-    cooling_names = {
-        normalize_proxy_name(proxy_name)
-        for proxy_name in cooling_proxy_names
-        if normalize_proxy_name(proxy_name)
-    }
     available_candidates = [
         proxy_name
         for proxy_name in candidates
-        if (
-            proxy_name != current_proxy_name
-            and proxy_name not in excluded_names
-            and proxy_name not in cooling_names
-        )
+        if proxy_name != current_proxy_name and proxy_name not in excluded_names
     ]
     stats_entries = proxy_stats_entries or {}
     available_candidates.sort(
@@ -228,7 +218,6 @@ def switch_clash_proxy(proxy_name: str) -> None:
 def run_pre_run_clash_ai_switch(
     *,
     excluded_proxy_names: Collection[str] = (),
-    cooling_proxy_names: Collection[str] = (),
     proxy_stats_entries: Mapping[str, ProxyStatsEntry] | None = None,
 ) -> dict[str, object]:
     try:
@@ -245,7 +234,6 @@ def run_pre_run_clash_ai_switch(
             candidates,
             current_proxy_name=current_proxy_name,
             excluded_proxy_names=excluded_proxy_names,
-            cooling_proxy_names=cooling_proxy_names,
             proxy_stats_entries=proxy_stats_entries,
         )
 
@@ -266,14 +254,6 @@ def run_pre_run_clash_ai_switch(
             }))
             if excluded_names_text:
                 print(f"自动运行前置：本地黑名单冷却期跳过节点：{excluded_names_text}。")
-        if cooling_proxy_names:
-            cooling_names_text = "、".join(sorted({
-                normalize_proxy_name(proxy_name)
-                for proxy_name in cooling_proxy_names
-                if normalize_proxy_name(proxy_name)
-            }))
-            if cooling_names_text:
-                print(f"自动运行前置：失败冷却期跳过节点：{cooling_names_text}。")
 
         for proxy_name in available_candidates:
             print(f"自动运行前置：测速 {proxy_name}")

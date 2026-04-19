@@ -66,6 +66,41 @@ STALE_LOCK_FILE_NAMES = (
 CHROME_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 PROFILE_DELETE_TIMEOUT_SECONDS = 10.0
 PROCESS_TERMINATION_POLL_SECONDS = 0.2
+DEFAULT_SMS_SOCKET_HOST = "127.0.0.1"
+DEFAULT_SMS_CODE_TIMEOUT_SECONDS = 120
+DEFAULT_SMS_CODE_REGEX = r"(?<!\d)(\d{4,8})(?!\d)"
+SMS_RECEIVER_LISTEN_BACKLOG = 5
+SMS_RECEIVER_BUFFER_SIZE = 4096
+SMS_RECEIVER_ACCEPT_TIMEOUT_SECONDS = 0.5
+SMS_RECEIVER_CONNECTION_TIMEOUT_SECONDS = 0.5
+SMS_CODE_SUBMIT_DISCOVERY_TIMEOUT_SECONDS = 5.0
+SMS_VERIFICATION_LOG_SIGNAL_TEXTS = (
+    "短信验证码已请求成功，可以开始等待接收短信。",
+    "请等待接收短信，收到后在当前页面输入验证码并点击提交验证，脚本会自动继续。",
+)
+DEFAULT_SMS_CODE_INPUT_SELECTORS = (
+    "input[autocomplete='one-time-code']",
+    "input[inputmode='numeric']",
+    "input[name*='code' i]",
+    "input[id*='code' i]",
+    "input[name*='otp' i]",
+    "input[id*='otp' i]",
+    "input[name*='verification' i]",
+    "input[id*='verification' i]",
+    "input[placeholder*='验证码']",
+    "input[aria-label*='验证码']",
+)
+DEFAULT_SMS_CODE_SUBMIT_TEXTS = (
+    "提交",
+    "验证",
+    "继续",
+    "下一步",
+    "confirm",
+    "continue",
+    "verify",
+    "submit",
+    "next",
+)
 
 TARGET_EXTENSION_ID = "niignaaoplafnpbcdgcgcajfjddcncgb"
 AUTO_RUN_BUTTON_SELECTOR = "#btn-auto-run"

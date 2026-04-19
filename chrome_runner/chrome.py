@@ -92,30 +92,50 @@ def wait_for_chrome_exit(process: subprocess.Popen[bytes]) -> int:
     return process.wait()
 
 
+def _is_process_group_alive(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False
+    return True
+
+
 def shutdown_chrome_process(
     process: subprocess.Popen[bytes],
     timeout_seconds: float = CHROME_SHUTDOWN_TIMEOUT_SECONDS,
 ) -> None:
-    if process.poll() is not None:
+    process_group_id = process.pid
+    if not _is_process_group_alive(process_group_id):
         return
 
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
         return
 
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
-        if process.poll() is not None:
+        if not _is_process_group_alive(process_group_id):
+            if process.poll() is None:
+                process.wait(timeout=timeout_seconds)
             return
         time.sleep(PROCESS_TERMINATION_POLL_SECONDS)
 
     try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
         return
 
-    process.wait(timeout=timeout_seconds)
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if not _is_process_group_alive(process_group_id):
+            break
+        time.sleep(PROCESS_TERMINATION_POLL_SECONDS)
+
+    if process.poll() is None:
+        process.wait(timeout=timeout_seconds)
 
 
 def delete_profile_directory(
