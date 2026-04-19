@@ -7,7 +7,7 @@ import argparse
 import sys
 import time
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from chrome_runner.chrome import (
@@ -45,6 +45,13 @@ from chrome_runner.proxy_blacklist import (
     load_active_proxy_blacklist_names,
     record_proxy_blacklist_hit,
 )
+from chrome_runner.proxy_stats import (
+    ProxyStatsEntry,
+    list_active_proxy_cooldown_names,
+    load_proxy_stats_entries,
+    record_proxy_run_result,
+    record_proxy_selection,
+)
 
 CLASH_AI_SWITCH_STRATEGY_ALWAYS = "always"
 CLASH_AI_SWITCH_STRATEGY_REUSE = "reuse"
@@ -77,6 +84,7 @@ class SingleRunResult:
     exit_code: int
     summary_text: str
     selected_proxy_name: str = ""
+    selected_proxy_delay_ms: int | None = None
     should_blacklist_selected_proxy: bool = False
 
     @property
@@ -97,6 +105,15 @@ class BatchProfileState:
     """Batch-level profile selection state."""
 
     next_profile_index: int = 0
+
+
+@dataclass(frozen=True)
+class ProxySelectionState:
+    """Current proxy filtering and priority state."""
+
+    blacklisted_proxy_names: frozenset[str] = frozenset()
+    cooling_proxy_names: frozenset[str] = frozenset()
+    stats_entries: dict[str, ProxyStatsEntry] = field(default_factory=dict)
 
 
 def parse_positive_int(raw_value: str) -> int:
@@ -153,7 +170,7 @@ def parse_args() -> argparse.Namespace:
         type=parse_positive_int,
         default=DEFAULT_PROXY_BLACKLIST_TTL_SECONDS,
         help=(
-            "本地黑名单冷却时长。节点在最近一次命中 add-phone 后，"
+            "本地节点冷却时长。节点在最近一次命中 add-phone 或完整流程失败后，"
             "达到该秒数前都会被跳过。"
             f"默认 {DEFAULT_PROXY_BLACKLIST_TTL_SECONDS} 秒。"
         ),
@@ -350,6 +367,21 @@ def maybe_reset_reused_proxy_for_blacklist(
     proxy_state.current_proxy_run_count = 0
 
 
+def maybe_reset_reused_proxy_for_cooldown(
+    proxy_state: BatchProxyState,
+    cooling_proxy_names: Collection[str],
+) -> None:
+    current_proxy_name = normalize_proxy_name(proxy_state.current_proxy_name)
+    if not current_proxy_name or current_proxy_name not in cooling_proxy_names:
+        return
+    print(
+        f"自动运行前置：当前复用节点 {current_proxy_name} 处于失败冷却期，"
+        "准备切换新节点。"
+    )
+    proxy_state.current_proxy_name = ""
+    proxy_state.current_proxy_run_count = 0
+
+
 def load_active_proxy_blacklist(
     args: argparse.Namespace,
     base_dir: Path,
@@ -359,6 +391,27 @@ def load_active_proxy_blacklist(
     return load_active_proxy_blacklist_names(
         base_dir,
         args.proxy_blacklist_ttl_seconds,
+    )
+
+
+def load_proxy_selection_state(
+    args: argparse.Namespace,
+    base_dir: Path,
+) -> ProxySelectionState:
+    active_proxy_blacklist = load_active_proxy_blacklist(args, base_dir)
+    if not should_enable_clash_ai_switch(args):
+        return ProxySelectionState(
+            blacklisted_proxy_names=active_proxy_blacklist,
+        )
+    proxy_stats_entries = load_proxy_stats_entries(base_dir)
+    active_proxy_cooldown = list_active_proxy_cooldown_names(
+        proxy_stats_entries,
+        args.proxy_blacklist_ttl_seconds,
+    )
+    return ProxySelectionState(
+        blacklisted_proxy_names=active_proxy_blacklist,
+        cooling_proxy_names=active_proxy_cooldown,
+        stats_entries=proxy_stats_entries,
     )
 
 
@@ -479,12 +532,52 @@ def update_batch_proxy_state(
     proxy_state.current_proxy_run_count = 1
 
 
+def maybe_record_selected_proxy_stats(
+    base_dir: Path,
+    *,
+    proxy_name: str,
+    delay_ms: int | None = None,
+) -> None:
+    proxy_name = normalize_proxy_name(proxy_name)
+    if not proxy_name:
+        return
+    record_proxy_selection(
+        base_dir,
+        proxy_name,
+        delay_ms=delay_ms,
+    )
+
+
+def maybe_record_selected_proxy_outcome(
+    base_dir: Path,
+    *,
+    proxy_name: str,
+    succeeded: bool,
+) -> None:
+    proxy_name = normalize_proxy_name(proxy_name)
+    if not proxy_name:
+        return
+    record_proxy_run_result(
+        base_dir,
+        proxy_name,
+        succeeded=succeeded,
+    )
+
+
+def parse_selected_proxy_delay(raw_value: object) -> int | None:
+    if isinstance(raw_value, (int, float)) and raw_value >= 0:
+        return int(raw_value)
+    return None
+
+
 def execute_single_run(
     args: argparse.Namespace,
     base_dir: Path,
     base_profile_dir: Path,
     *,
     excluded_proxy_names: frozenset[str] = frozenset(),
+    cooling_proxy_names: frozenset[str] = frozenset(),
+    proxy_stats_entries: dict[str, ProxyStatsEntry] | None = None,
     current_proxy_name: str = "",
     should_switch_proxy: bool | None = None,
 ) -> SingleRunResult:
@@ -503,14 +596,30 @@ def execute_single_run(
         if should_switch_proxy
         else normalize_proxy_name(current_proxy_name)
     )
+    selected_proxy_delay_ms: int | None = None
     should_blacklist_selected_proxy = False
+    should_record_proxy_outcome = False
+    proxy_outcome_recorded = False
 
     try:
         if should_switch_proxy:
             switch_result = run_pre_run_clash_ai_switch(
-                excluded_proxy_names=excluded_proxy_names
+                excluded_proxy_names=excluded_proxy_names,
+                cooling_proxy_names=cooling_proxy_names,
+                proxy_stats_entries=proxy_stats_entries,
             )
             selected_proxy_name = normalize_proxy_name(switch_result.get("proxy_name"))
+            selected_proxy_delay_ms = parse_selected_proxy_delay(
+                switch_result.get("delay")
+            )
+
+        if selected_proxy_name:
+            maybe_record_selected_proxy_stats(
+                base_dir,
+                proxy_name=selected_proxy_name,
+                delay_ms=selected_proxy_delay_ms,
+            )
+            should_record_proxy_outcome = args.run_extension
 
         ensure_chrome_exists()
         if base_profile_dir.exists():
@@ -534,6 +643,13 @@ def execute_single_run(
                     max_attempt_seconds=args.max_attempt_seconds,
                 )
                 exit_code, summary_text = report_extension_result(result)
+                if should_record_proxy_outcome:
+                    maybe_record_selected_proxy_outcome(
+                        base_dir,
+                        proxy_name=selected_proxy_name,
+                        succeeded=result.outcome == "success",
+                    )
+                    proxy_outcome_recorded = True
                 should_blacklist_selected_proxy = (
                     bool(selected_proxy_name)
                     and should_blacklist_proxy_for_add_phone(result)
@@ -575,6 +691,13 @@ def execute_single_run(
                 summary_text = f"{summary_text}；{note}"
     except Exception as exc:  # noqa: BLE001
         summary_text = f"启动失败: {exc}"
+        if should_record_proxy_outcome and not proxy_outcome_recorded:
+            maybe_record_selected_proxy_outcome(
+                base_dir,
+                proxy_name=selected_proxy_name,
+                succeeded=False,
+            )
+            proxy_outcome_recorded = True
         print(summary_text, file=sys.stderr)
         exit_code = 1
     finally:
@@ -596,6 +719,7 @@ def execute_single_run(
         exit_code=exit_code,
         summary_text=summary_text,
         selected_proxy_name=selected_proxy_name,
+        selected_proxy_delay_ms=selected_proxy_delay_ms,
         should_blacklist_selected_proxy=should_blacklist_selected_proxy,
     )
 
@@ -682,8 +806,15 @@ def run_batch(
         print(f"第 {attempt_index}/{args.repeat_count} 轮开始")
         print(f"本轮基准 profile: {profile_name}")
         attempt_started_at = time.perf_counter()
-        active_proxy_blacklist = load_active_proxy_blacklist(args, base_dir)
-        maybe_reset_reused_proxy_for_blacklist(proxy_state, active_proxy_blacklist)
+        proxy_selection_state = load_proxy_selection_state(args, base_dir)
+        maybe_reset_reused_proxy_for_blacklist(
+            proxy_state,
+            proxy_selection_state.blacklisted_proxy_names,
+        )
+        maybe_reset_reused_proxy_for_cooldown(
+            proxy_state,
+            proxy_selection_state.cooling_proxy_names,
+        )
         should_switch_proxy = should_switch_proxy_for_batch_attempt(args, proxy_state)
         if not should_switch_proxy:
             maybe_report_reused_proxy_for_batch_attempt(args, proxy_state)
@@ -691,7 +822,9 @@ def run_batch(
             args,
             base_dir,
             base_profile_dir,
-            excluded_proxy_names=active_proxy_blacklist,
+            excluded_proxy_names=proxy_selection_state.blacklisted_proxy_names,
+            cooling_proxy_names=proxy_selection_state.cooling_proxy_names,
+            proxy_stats_entries=proxy_selection_state.stats_entries,
             current_proxy_name=proxy_state.current_proxy_name,
             should_switch_proxy=should_switch_proxy,
         )
@@ -743,12 +876,14 @@ def main() -> int:
     base_profile_dir = build_base_profile_dir(base_dir, profile_name)
     print(f"本轮基准 profile: {profile_name}")
     started_at = time.perf_counter()
-    active_proxy_blacklist = load_active_proxy_blacklist(args, base_dir)
+    proxy_selection_state = load_proxy_selection_state(args, base_dir)
     single_run_result = execute_single_run(
         args,
         base_dir,
         base_profile_dir,
-        excluded_proxy_names=active_proxy_blacklist,
+        excluded_proxy_names=proxy_selection_state.blacklisted_proxy_names,
+        cooling_proxy_names=proxy_selection_state.cooling_proxy_names,
+        proxy_stats_entries=proxy_selection_state.stats_entries,
     )
     result = RunAttemptResult(
         index=1,

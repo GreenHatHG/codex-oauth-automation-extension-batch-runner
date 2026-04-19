@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import json
-import random
 import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 
 from .constants import (
     CLASH_AI_SWITCH_ERROR_PREFIX,
@@ -23,6 +22,7 @@ from .constants import (
     CLASH_SKIP_NAME_WORDS,
     CLASH_SKIP_PROXY_TYPES,
 )
+from .proxy_stats import ProxyStatsEntry, build_proxy_priority_sort_key
 
 
 def normalize_proxy_name(value: object) -> str:
@@ -169,17 +169,33 @@ def build_available_proxy_candidates(
     *,
     current_proxy_name: str,
     excluded_proxy_names: Collection[str] = (),
+    cooling_proxy_names: Collection[str] = (),
+    proxy_stats_entries: Mapping[str, ProxyStatsEntry] | None = None,
 ) -> list[str]:
     excluded_names = {
         normalize_proxy_name(proxy_name)
         for proxy_name in excluded_proxy_names
         if normalize_proxy_name(proxy_name)
     }
-    return [
+    cooling_names = {
+        normalize_proxy_name(proxy_name)
+        for proxy_name in cooling_proxy_names
+        if normalize_proxy_name(proxy_name)
+    }
+    available_candidates = [
         proxy_name
         for proxy_name in candidates
-        if proxy_name != current_proxy_name and proxy_name not in excluded_names
+        if (
+            proxy_name != current_proxy_name
+            and proxy_name not in excluded_names
+            and proxy_name not in cooling_names
+        )
     ]
+    stats_entries = proxy_stats_entries or {}
+    available_candidates.sort(
+        key=lambda proxy_name: build_proxy_priority_sort_key(proxy_name, stats_entries)
+    )
+    return available_candidates
 
 
 def probe_clash_proxy_delay(proxy_name: str) -> int | None:
@@ -212,6 +228,8 @@ def switch_clash_proxy(proxy_name: str) -> None:
 def run_pre_run_clash_ai_switch(
     *,
     excluded_proxy_names: Collection[str] = (),
+    cooling_proxy_names: Collection[str] = (),
+    proxy_stats_entries: Mapping[str, ProxyStatsEntry] | None = None,
 ) -> dict[str, object]:
     try:
         snapshot = fetch_clash_proxy_snapshot()
@@ -223,12 +241,12 @@ def run_pre_run_clash_ai_switch(
                 current_proxy_name = normalize_proxy_name(group.get("now"))
 
         candidates = pick_clash_candidates(snapshot)
-        shuffled_candidates = list(candidates)
-        random.shuffle(shuffled_candidates)
         available_candidates = build_available_proxy_candidates(
-            shuffled_candidates,
+            candidates,
             current_proxy_name=current_proxy_name,
             excluded_proxy_names=excluded_proxy_names,
+            cooling_proxy_names=cooling_proxy_names,
+            proxy_stats_entries=proxy_stats_entries,
         )
 
         if not available_candidates:
@@ -248,6 +266,14 @@ def run_pre_run_clash_ai_switch(
             }))
             if excluded_names_text:
                 print(f"自动运行前置：本地黑名单冷却期跳过节点：{excluded_names_text}。")
+        if cooling_proxy_names:
+            cooling_names_text = "、".join(sorted({
+                normalize_proxy_name(proxy_name)
+                for proxy_name in cooling_proxy_names
+                if normalize_proxy_name(proxy_name)
+            }))
+            if cooling_names_text:
+                print(f"自动运行前置：失败冷却期跳过节点：{cooling_names_text}。")
 
         for proxy_name in available_candidates:
             print(f"自动运行前置：测速 {proxy_name}")
