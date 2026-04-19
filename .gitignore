@@ -1,3 +1,5 @@
 .ace-tool/
 chrome-profile*/
 __pycache__/
+.proxy-blacklist.json
+.profile-blacklist.json
