@@ -179,6 +179,15 @@ def parse_args() -> argparse.Namespace:
         help="指定要运行的扩展 ID。",
     )
     parser.add_argument(
+        "--max-attempt-seconds",
+        type=parse_positive_int,
+        default=None,
+        help=(
+            "单轮最大运行时间。超过后自动关闭浏览器并清理运行目录，"
+            "仅对 --run-extension 生效。"
+        ),
+    )
+    parser.add_argument(
         "--repeat-count",
         type=parse_positive_int,
         default=1,
@@ -240,9 +249,18 @@ def report_extension_result(result: ExtensionRunResult) -> tuple[int, str]:
         print(message, file=sys.stderr)
         return 1, message
 
+    if result.outcome == "attempt_timeout":
+        message = (
+            f"扩展执行超时：{result.status_text}；本轮运行已超过 "
+            f"{int(result.timeout_seconds)} 秒。"
+        )
+        message = f"{message}{recent_logs_text}"
+        print(message, file=sys.stderr)
+        return 1, message
+
     message = (
         f"扩展执行卡住：{result.status_text}；连续 "
-        f"{int(result.stagnant_seconds)} 秒没有进度。"
+        f"{int(result.timeout_seconds)} 秒没有进度。"
     )
     message = f"{message}{recent_logs_text}"
     print(message, file=sys.stderr)
@@ -513,6 +531,7 @@ def execute_single_run(
                     runtime_profile_dir,
                     remote_debugging_port,
                     args.extension_id,
+                    max_attempt_seconds=args.max_attempt_seconds,
                 )
                 exit_code, summary_text = report_extension_result(result)
                 should_blacklist_selected_proxy = (
@@ -593,6 +612,8 @@ def validate_batch_args(
         raise RuntimeError(
             "--pre-run-clash-ai-switch 和 --clash-ai-switch-strategy 不能同时使用。"
         )
+    if args.max_attempt_seconds is not None and not args.run_extension:
+        raise RuntimeError("--max-attempt-seconds 需要搭配 --run-extension。")
     if args.repeat_count == 1:
         return
     if not args.run_extension:

@@ -68,12 +68,16 @@ class ExtensionRunResult:
 
     outcome: str
     status_text: str
-    stagnant_seconds: float = 0.0
+    timeout_seconds: float = 0.0
     recent_logs: tuple[str, ...] = ()
 
 
 def load_json_file(file_path: Path) -> dict[str, object]:
     return json.loads(file_path.read_text(encoding="utf-8"))
+
+
+class AttemptTimeoutError(TimeoutError):
+    """Raised when a single automatic run exceeds the configured attempt limit."""
 
 
 def read_extension_settings(profile_dir: Path, extension_id: str) -> dict[str, object]:
@@ -147,8 +151,11 @@ def build_extension_page_url(profile_dir: Path, extension_id: str) -> str:
     return f"chrome-extension://{extension_id}/{side_panel_path}"
 
 
-def wait_for_extension_ready(devtools_client: DevToolsClient) -> None:
-    deadline = time.time() + PAGE_READY_TIMEOUT_SECONDS
+def wait_for_extension_ready(
+    devtools_client: DevToolsClient,
+    timeout_seconds: float = PAGE_READY_TIMEOUT_SECONDS,
+) -> None:
+    deadline = time.time() + timeout_seconds
     readiness_check = (
         "document.readyState === 'complete' "
         f"&& Boolean(document.querySelector({json.dumps(AUTO_RUN_BUTTON_SELECTOR)}))"
@@ -162,8 +169,11 @@ def wait_for_extension_ready(devtools_client: DevToolsClient) -> None:
     raise TimeoutError("扩展页面未在预期时间内完成加载。")
 
 
-def click_extension_auto_run(devtools_client: DevToolsClient) -> None:
-    deadline = time.time() + BUTTON_CLICK_TIMEOUT_SECONDS
+def click_extension_auto_run(
+    devtools_client: DevToolsClient,
+    timeout_seconds: float = BUTTON_CLICK_TIMEOUT_SECONDS,
+) -> None:
+    deadline = time.time() + timeout_seconds
     script = EXTENSION_START_SCRIPT_TEMPLATE % {
         "auto_run_button": json.dumps(AUTO_RUN_BUTTON_SELECTOR),
         "run_now_button": json.dumps(AUTO_RUN_NOW_BUTTON_SELECTOR),
@@ -247,13 +257,55 @@ def classify_extension_snapshot(
         return ExtensionRunResult(
             "timeout",
             status_text,
-            stagnant_seconds=stagnant_seconds,
+            timeout_seconds=stagnant_seconds,
             recent_logs=snapshot.recent_logs,
         )
     return None
 
 
-def monitor_extension_run(devtools_client: DevToolsClient) -> ExtensionRunResult:
+def has_attempt_timed_out(
+    attempt_started_at: float,
+    max_attempt_seconds: int | None,
+) -> bool:
+    if max_attempt_seconds is None:
+        return False
+    return (time.monotonic() - attempt_started_at) >= max_attempt_seconds
+
+
+def build_attempt_timeout_result(
+    status_text: str,
+    *,
+    timeout_seconds: int,
+    recent_logs: tuple[str, ...] = (),
+) -> ExtensionRunResult:
+    return ExtensionRunResult(
+        "attempt_timeout",
+        status_text or "单轮运行时间达到上限",
+        timeout_seconds=timeout_seconds,
+        recent_logs=recent_logs,
+    )
+
+
+def resolve_operation_timeout_seconds(
+    attempt_started_at: float,
+    max_attempt_seconds: int | None,
+    default_timeout_seconds: float,
+) -> float:
+    if max_attempt_seconds is None:
+        return default_timeout_seconds
+
+    remaining_seconds = max_attempt_seconds - (time.monotonic() - attempt_started_at)
+    if remaining_seconds <= 0:
+        raise AttemptTimeoutError("单轮运行时间达到上限")
+    return min(default_timeout_seconds, remaining_seconds)
+
+
+def monitor_extension_run(
+    devtools_client: DevToolsClient,
+    *,
+    attempt_started_at: float,
+    max_attempt_seconds: int | None = None,
+) -> ExtensionRunResult:
     snapshot = capture_extension_snapshot(devtools_client)
     last_snapshot = snapshot
     last_change_at = time.time()
@@ -272,8 +324,26 @@ def monitor_extension_run(devtools_client: DevToolsClient) -> ExtensionRunResult
         )
         if outcome is not None:
             return outcome
+        if has_attempt_timed_out(attempt_started_at, max_attempt_seconds):
+            return build_attempt_timeout_result(
+                last_snapshot.status_text or "状态未知",
+                timeout_seconds=max_attempt_seconds or 0,
+                recent_logs=last_snapshot.recent_logs,
+            )
 
-        time.sleep(RUN_MONITOR_POLL_INTERVAL_SECONDS)
+        sleep_seconds = RUN_MONITOR_POLL_INTERVAL_SECONDS
+        if max_attempt_seconds is not None:
+            remaining_seconds = max_attempt_seconds - (
+                time.monotonic() - attempt_started_at
+            )
+            if remaining_seconds <= 0:
+                return build_attempt_timeout_result(
+                    last_snapshot.status_text or "状态未知",
+                    timeout_seconds=max_attempt_seconds,
+                    recent_logs=last_snapshot.recent_logs,
+                )
+            sleep_seconds = min(sleep_seconds, remaining_seconds)
+        time.sleep(sleep_seconds)
         snapshot = capture_extension_snapshot(devtools_client)
         if snapshot.fingerprint != last_snapshot.fingerprint:
             last_snapshot = snapshot
@@ -287,6 +357,7 @@ def create_minimized_extension_target(
     browser_devtools_client: DevToolsClient,
     devtools_port: int,
     extension_url: str,
+    timeout_seconds: float = DEVTOOLS_READY_TIMEOUT_SECONDS,
 ) -> str:
     response = browser_devtools_client.call(
         "Target.createTarget",
@@ -302,41 +373,99 @@ def create_minimized_extension_target(
     target_id = str(response.get("result", {}).get("targetId", "")).strip()
     if not target_id:
         raise RuntimeError("创建扩展目标页失败：缺少 targetId。")
-    return wait_for_target_websocket_url(devtools_port, target_id)
+    return wait_for_target_websocket_url(
+        devtools_port,
+        target_id,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def run_extension(
     profile_dir: Path,
     devtools_port: int,
     extension_id: str,
+    *,
+    max_attempt_seconds: int | None = None,
 ) -> ExtensionRunResult:
+    attempt_started_at = time.monotonic()
     extension_url = build_extension_page_url(profile_dir, extension_id)
-    wait_for_devtools_ready(devtools_port, DEVTOOLS_READY_TIMEOUT_SECONDS)
-    browser_websocket_url = fetch_browser_websocket_url(devtools_port)
-    browser_devtools_client = DevToolsClient(
-        browser_websocket_url,
-        timeout_seconds=PAGE_READY_TIMEOUT_SECONDS,
-    )
     try:
-        websocket_url = create_minimized_extension_target(
-            browser_devtools_client,
+        wait_for_devtools_ready(
             devtools_port,
-            extension_url,
+            resolve_operation_timeout_seconds(
+                attempt_started_at,
+                max_attempt_seconds,
+                DEVTOOLS_READY_TIMEOUT_SECONDS,
+            ),
         )
-        devtools_client = DevToolsClient(
-            websocket_url,
-            timeout_seconds=PAGE_READY_TIMEOUT_SECONDS,
+        browser_websocket_url = fetch_browser_websocket_url(devtools_port)
+        browser_devtools_client = DevToolsClient(
+            browser_websocket_url,
+            timeout_seconds=resolve_operation_timeout_seconds(
+                attempt_started_at,
+                max_attempt_seconds,
+                PAGE_READY_TIMEOUT_SECONDS,
+            ),
         )
-    except Exception:
-        browser_devtools_client.close()
-        raise
+        try:
+            websocket_url = create_minimized_extension_target(
+                browser_devtools_client,
+                devtools_port,
+                extension_url,
+                timeout_seconds=resolve_operation_timeout_seconds(
+                    attempt_started_at,
+                    max_attempt_seconds,
+                    DEVTOOLS_READY_TIMEOUT_SECONDS,
+                ),
+            )
+            devtools_client = DevToolsClient(
+                websocket_url,
+                timeout_seconds=resolve_operation_timeout_seconds(
+                    attempt_started_at,
+                    max_attempt_seconds,
+                    PAGE_READY_TIMEOUT_SECONDS,
+                ),
+            )
+        except Exception:
+            browser_devtools_client.close()
+            raise
 
-    try:
-        devtools_client.call("Page.enable")
-        devtools_client.call("Runtime.enable")
-        wait_for_extension_ready(devtools_client)
-        click_extension_auto_run(devtools_client)
-        return monitor_extension_run(devtools_client)
-    finally:
-        devtools_client.close()
-        browser_devtools_client.close()
+        try:
+            devtools_client.call("Page.enable")
+            devtools_client.call("Runtime.enable")
+            wait_for_extension_ready(
+                devtools_client,
+                timeout_seconds=resolve_operation_timeout_seconds(
+                    attempt_started_at,
+                    max_attempt_seconds,
+                    PAGE_READY_TIMEOUT_SECONDS,
+                ),
+            )
+            click_extension_auto_run(
+                devtools_client,
+                timeout_seconds=resolve_operation_timeout_seconds(
+                    attempt_started_at,
+                    max_attempt_seconds,
+                    BUTTON_CLICK_TIMEOUT_SECONDS,
+                ),
+            )
+            return monitor_extension_run(
+                devtools_client,
+                attempt_started_at=attempt_started_at,
+                max_attempt_seconds=max_attempt_seconds,
+            )
+        finally:
+            devtools_client.close()
+            browser_devtools_client.close()
+    except AttemptTimeoutError as exc:
+        return build_attempt_timeout_result(
+            str(exc),
+            timeout_seconds=max_attempt_seconds or 0,
+        )
+    except TimeoutError as exc:
+        if has_attempt_timed_out(attempt_started_at, max_attempt_seconds):
+            return build_attempt_timeout_result(
+                str(exc),
+                timeout_seconds=max_attempt_seconds or 0,
+            )
+        raise
