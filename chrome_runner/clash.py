@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Collection
 
 from .constants import (
     CLASH_AI_SWITCH_ERROR_PREFIX,
@@ -163,6 +164,24 @@ def pick_clash_candidates(snapshot: dict[str, object]) -> list[str]:
     return candidates
 
 
+def build_available_proxy_candidates(
+    candidates: list[str],
+    *,
+    current_proxy_name: str,
+    excluded_proxy_names: Collection[str] = (),
+) -> list[str]:
+    excluded_names = {
+        normalize_proxy_name(proxy_name)
+        for proxy_name in excluded_proxy_names
+        if normalize_proxy_name(proxy_name)
+    }
+    return [
+        proxy_name
+        for proxy_name in candidates
+        if proxy_name != current_proxy_name and proxy_name not in excluded_names
+    ]
+
+
 def probe_clash_proxy_delay(proxy_name: str) -> int | None:
     try:
         payload = request_json(
@@ -190,7 +209,10 @@ def switch_clash_proxy(proxy_name: str) -> None:
     )
 
 
-def run_pre_run_clash_ai_switch() -> dict[str, object]:
+def run_pre_run_clash_ai_switch(
+    *,
+    excluded_proxy_names: Collection[str] = (),
+) -> dict[str, object]:
     try:
         snapshot = fetch_clash_proxy_snapshot()
         proxies = snapshot.get("proxies", {})
@@ -203,11 +225,11 @@ def run_pre_run_clash_ai_switch() -> dict[str, object]:
         candidates = pick_clash_candidates(snapshot)
         shuffled_candidates = list(candidates)
         random.shuffle(shuffled_candidates)
-        available_candidates = [
-            proxy_name
-            for proxy_name in shuffled_candidates
-            if proxy_name != current_proxy_name
-        ]
+        available_candidates = build_available_proxy_candidates(
+            shuffled_candidates,
+            current_proxy_name=current_proxy_name,
+            excluded_proxy_names=excluded_proxy_names,
+        )
 
         if not available_candidates:
             if current_proxy_name:
@@ -218,6 +240,14 @@ def run_pre_run_clash_ai_switch() -> dict[str, object]:
             f"自动运行前置：开始选择 {CLASH_GROUP_NAME} 节点，当前节点："
             f"{current_proxy_name or '未知'}。"
         )
+        if excluded_proxy_names:
+            excluded_names_text = "、".join(sorted({
+                normalize_proxy_name(proxy_name)
+                for proxy_name in excluded_proxy_names
+                if normalize_proxy_name(proxy_name)
+            }))
+            if excluded_names_text:
+                print(f"自动运行前置：内存黑名单跳过节点：{excluded_names_text}。")
 
         for proxy_name in available_candidates:
             print(f"自动运行前置：测速 {proxy_name}")

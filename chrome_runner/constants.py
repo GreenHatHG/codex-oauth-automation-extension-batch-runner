@@ -47,6 +47,8 @@ CHROME_FLAGS = (
     "--no-first-run",
     "--no-default-browser-check",
 )
+CHROME_NO_STARTUP_WINDOW_FLAG = "--no-startup-window"
+DEVTOOLS_TARGET_DISCOVERY_TIMEOUT_SECONDS = 15.0
 STALE_LOCK_FILE_NAMES = (
     "SingletonCookie",
     "SingletonLock",
@@ -65,6 +67,7 @@ STATUS_BAR_SELECTOR = "#status-bar"
 STATUS_DISPLAY_SELECTOR = "#display-status"
 LOG_LINE_SELECTOR = "#log-area .log-line"
 STEP_STATUS_SELECTOR = ".step-status"
+EXTENSION_RESULT_LOG_LINE_LIMIT = 20
 
 RUNNING_STATUS_TEXTS = (
     "运行中",
@@ -82,6 +85,12 @@ SUCCESS_STATUS_TEXTS = (
 FAILURE_STATUS_TEXTS = (
     "失败",
     "已停止",
+)
+ADD_PHONE_ERROR_SIGNAL_TEXTS = (
+    "auth.openai.com/add-phone",
+    "进入 add-phone",
+    "手机号页面",
+    "手机号页",
 )
 
 EXTENSION_START_SCRIPT_TEMPLATE = """
@@ -129,7 +138,11 @@ EXTENSION_STATUS_SNAPSHOT_SCRIPT_TEMPLATE = """
   const statusText = document.querySelector(%(status_display_selector)s)?.textContent?.trim() || '';
   const statusBarClass = document.querySelector(%(status_bar_selector)s)?.className || '';
   const autoRunButtonText = document.querySelector(%(auto_run_button_selector)s)?.textContent?.trim() || '';
-  const logCount = document.querySelectorAll(%(log_line_selector)s).length;
+  const logLines = Array.from(document.querySelectorAll(%(log_line_selector)s))
+    .map((element) => (element.textContent || '').trim())
+    .filter(Boolean);
+  const logCount = logLines.length;
+  const recentLogs = logLines.slice(-%(recent_log_limit)s);
   const steps = Array.from(document.querySelectorAll(%(step_status_selector)s)).map((element) => ({
     step: element.getAttribute('data-step') || '',
     text: (element.textContent || '').trim(),
@@ -140,6 +153,7 @@ EXTENSION_STATUS_SNAPSHOT_SCRIPT_TEMPLATE = """
     statusBarClass,
     autoRunButtonText,
     logCount,
+    recentLogs,
     steps,
   };
 })()

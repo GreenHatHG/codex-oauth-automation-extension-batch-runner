@@ -19,6 +19,7 @@ from .constants import (
     PAGE_READY_TIMEOUT_SECONDS,
     RUN_MONITOR_POLL_INTERVAL_SECONDS,
     RUN_MONITOR_STAGNATION_TIMEOUT_SECONDS,
+    EXTENSION_RESULT_LOG_LINE_LIMIT,
     RUNNING_STATUS_TEXTS,
     SCHEDULED_STATUS_TEXTS,
     STATUS_BAR_SELECTOR,
@@ -32,8 +33,9 @@ from .constants import (
 from .devtools import (
     DevToolsClient,
     evaluate_javascript,
-    fetch_page_websocket_url,
+    fetch_browser_websocket_url,
     wait_for_devtools_ready,
+    wait_for_target_websocket_url,
 )
 
 
@@ -45,15 +47,17 @@ class ExtensionSnapshot:
     status_bar_class: str
     auto_run_button_text: str
     log_count: int
+    recent_logs: tuple[str, ...]
     step_signature: tuple[str, ...]
 
     @property
-    def fingerprint(self) -> tuple[str, str, str, int, tuple[str, ...]]:
+    def fingerprint(self) -> tuple[str, str, str, int, tuple[str, ...], tuple[str, ...]]:
         return (
             self.status_text,
             self.status_bar_class,
             self.auto_run_button_text,
             self.log_count,
+            self.recent_logs,
             self.step_signature,
         )
 
@@ -65,6 +69,7 @@ class ExtensionRunResult:
     outcome: str
     status_text: str
     stagnant_seconds: float = 0.0
+    recent_logs: tuple[str, ...] = ()
 
 
 def load_json_file(file_path: Path) -> dict[str, object]:
@@ -189,13 +194,23 @@ def capture_extension_snapshot(devtools_client: DevToolsClient) -> ExtensionSnap
         "status_bar_selector": json.dumps(STATUS_BAR_SELECTOR),
         "auto_run_button_selector": json.dumps(AUTO_RUN_BUTTON_SELECTOR),
         "log_line_selector": json.dumps(LOG_LINE_SELECTOR),
+        "recent_log_limit": EXTENSION_RESULT_LOG_LINE_LIMIT,
         "step_status_selector": json.dumps(STEP_STATUS_SELECTOR),
     }
     payload = evaluate_javascript(devtools_client, script)
     if not isinstance(payload, dict):
         raise RuntimeError("扩展状态采样返回了非预期数据。")
 
+    raw_recent_logs = payload.get("recentLogs", [])
     raw_steps = payload.get("steps", [])
+    recent_logs: tuple[str, ...] = ()
+    if isinstance(raw_recent_logs, list):
+        recent_logs = tuple(
+            str(item).strip()
+            for item in raw_recent_logs
+            if str(item).strip()
+        )
+
     step_signature: tuple[str, ...] = ()
     if isinstance(raw_steps, list):
         step_signature = tuple(
@@ -209,6 +224,7 @@ def capture_extension_snapshot(devtools_client: DevToolsClient) -> ExtensionSnap
         status_bar_class=str(payload.get("statusBarClass", "")).strip(),
         auto_run_button_text=str(payload.get("autoRunButtonText", "")).strip(),
         log_count=max(0, int(payload.get("logCount", 0) or 0)),
+        recent_logs=recent_logs,
         step_signature=step_signature,
     )
 
@@ -221,10 +237,19 @@ def classify_extension_snapshot(
     if any(text in snapshot.status_text for text in SUCCESS_STATUS_TEXTS):
         return ExtensionRunResult("success", snapshot.status_text)
     if any(text in snapshot.status_text for text in FAILURE_STATUS_TEXTS):
-        return ExtensionRunResult("failure", snapshot.status_text)
+        return ExtensionRunResult(
+            "failure",
+            snapshot.status_text,
+            recent_logs=snapshot.recent_logs,
+        )
     if stagnant_seconds >= RUN_MONITOR_STAGNATION_TIMEOUT_SECONDS:
         status_text = snapshot.status_text or "状态长期无变化"
-        return ExtensionRunResult("timeout", status_text, stagnant_seconds=stagnant_seconds)
+        return ExtensionRunResult(
+            "timeout",
+            status_text,
+            stagnant_seconds=stagnant_seconds,
+            recent_logs=snapshot.recent_logs,
+        )
     return None
 
 
@@ -258,6 +283,28 @@ def monitor_extension_run(devtools_client: DevToolsClient) -> ExtensionRunResult
                 last_reported_status = snapshot.status_text
 
 
+def create_minimized_extension_target(
+    browser_devtools_client: DevToolsClient,
+    devtools_port: int,
+    extension_url: str,
+) -> str:
+    response = browser_devtools_client.call(
+        "Target.createTarget",
+        {
+            "url": extension_url,
+            "newWindow": True,
+            "windowState": "minimized",
+        },
+    )
+    if response.get("error"):
+        raise RuntimeError(f"创建扩展目标页失败: {response['error']}")
+
+    target_id = str(response.get("result", {}).get("targetId", "")).strip()
+    if not target_id:
+        raise RuntimeError("创建扩展目标页失败：缺少 targetId。")
+    return wait_for_target_websocket_url(devtools_port, target_id)
+
+
 def run_extension(
     profile_dir: Path,
     devtools_port: int,
@@ -265,19 +312,31 @@ def run_extension(
 ) -> ExtensionRunResult:
     extension_url = build_extension_page_url(profile_dir, extension_id)
     wait_for_devtools_ready(devtools_port, DEVTOOLS_READY_TIMEOUT_SECONDS)
-    websocket_url = fetch_page_websocket_url(devtools_port)
-    devtools_client = DevToolsClient(
-        websocket_url,
+    browser_websocket_url = fetch_browser_websocket_url(devtools_port)
+    browser_devtools_client = DevToolsClient(
+        browser_websocket_url,
         timeout_seconds=PAGE_READY_TIMEOUT_SECONDS,
     )
+    try:
+        websocket_url = create_minimized_extension_target(
+            browser_devtools_client,
+            devtools_port,
+            extension_url,
+        )
+        devtools_client = DevToolsClient(
+            websocket_url,
+            timeout_seconds=PAGE_READY_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        browser_devtools_client.close()
+        raise
 
     try:
         devtools_client.call("Page.enable")
         devtools_client.call("Runtime.enable")
-        devtools_client.call("Page.navigate", {"url": extension_url})
-        devtools_client.wait_for_event("Page.loadEventFired", PAGE_READY_TIMEOUT_SECONDS)
         wait_for_extension_ready(devtools_client)
         click_extension_auto_run(devtools_client)
         return monitor_extension_run(devtools_client)
     finally:
         devtools_client.close()
+        browser_devtools_client.close()

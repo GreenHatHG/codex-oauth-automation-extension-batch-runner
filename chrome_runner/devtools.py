@@ -17,6 +17,7 @@ from .constants import (
     DEVTOOLS_HOST,
     DEVTOOLS_HTTP_TIMEOUT_SECONDS,
     DEVTOOLS_POLL_INTERVAL_SECONDS,
+    DEVTOOLS_TARGET_DISCOVERY_TIMEOUT_SECONDS,
 )
 
 
@@ -195,6 +196,17 @@ def wait_for_devtools_ready(port: int, timeout_seconds: float) -> None:
     raise TimeoutError("Chrome DevTools 调试端口未在预期时间内就绪。")
 
 
+def fetch_browser_websocket_url(port: int) -> str:
+    version_url = f"http://{DEVTOOLS_HOST}:{port}/json/version"
+    payload = fetch_json(version_url)
+    if not isinstance(payload, dict):
+        raise RuntimeError("Chrome DevTools 返回了非预期的版本信息。")
+    websocket_url = payload.get("webSocketDebuggerUrl")
+    if not websocket_url:
+        raise RuntimeError("没有找到可用的 Chrome browser 调试目标。")
+    return str(websocket_url)
+
+
 def fetch_page_websocket_url(port: int) -> str:
     targets_url = f"http://{DEVTOOLS_HOST}:{port}/json/list"
     targets = fetch_json(targets_url)
@@ -206,6 +218,29 @@ def fetch_page_websocket_url(port: int) -> str:
             return str(target["webSocketDebuggerUrl"])
 
     raise RuntimeError("没有找到可用的 Chrome 页面调试目标。")
+
+
+def wait_for_target_websocket_url(
+    port: int,
+    target_id: str,
+    timeout_seconds: float = DEVTOOLS_TARGET_DISCOVERY_TIMEOUT_SECONDS,
+) -> str:
+    deadline = time.time() + timeout_seconds
+    targets_url = f"http://{DEVTOOLS_HOST}:{port}/json/list"
+
+    while time.time() < deadline:
+        targets = fetch_json(targets_url)
+        if isinstance(targets, list):
+            for target in targets:
+                if (
+                    target.get("id") == target_id
+                    and target.get("type") == "page"
+                    and target.get("webSocketDebuggerUrl")
+                ):
+                    return str(target["webSocketDebuggerUrl"])
+        time.sleep(DEVTOOLS_POLL_INTERVAL_SECONDS)
+
+    raise TimeoutError(f"没有找到目标页调试连接: {target_id}")
 
 
 def evaluate_javascript(devtools_client: DevToolsClient, expression: str) -> object:

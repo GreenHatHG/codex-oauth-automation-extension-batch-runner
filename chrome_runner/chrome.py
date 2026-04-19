@@ -14,6 +14,7 @@ from pathlib import Path
 from .constants import (
     CHROME_EXECUTABLE,
     CHROME_FLAGS,
+    CHROME_NO_STARTUP_WINDOW_FLAG,
     CHROME_SHUTDOWN_TIMEOUT_SECONDS,
     DEVTOOLS_HOST,
     PROCESS_TERMINATION_POLL_SECONDS,
@@ -55,12 +56,12 @@ def copy_profile_directory(source_dir: Path, target_dir: Path) -> None:
     shutil.copytree(source_dir, target_dir)
     remove_stale_lock_files(target_dir)
 
-
 def build_command(
     profile_dir: Path,
     *,
     start_page: str = START_PAGE,
     remote_debugging_port: int | None = None,
+    suppress_startup_window: bool = False,
 ) -> list[str]:
     command = [
         str(CHROME_EXECUTABLE),
@@ -69,11 +70,16 @@ def build_command(
     ]
     if remote_debugging_port is not None:
         command.append(f"--remote-debugging-port={remote_debugging_port}")
-    command.append(start_page)
+    if suppress_startup_window:
+        command.append(CHROME_NO_STARTUP_WINDOW_FLAG)
+    else:
+        command.append(start_page)
     return command
 
 
-def launch_chrome(command: list[str]) -> subprocess.Popen[bytes]:
+def launch_chrome(
+    command: list[str],
+) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         command,
         start_new_session=True,
