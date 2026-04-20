@@ -114,11 +114,19 @@ DEFAULT_SMS_CODE_SUBMIT_TEXTS = (
 )
 
 TARGET_EXTENSION_ID = "niignaaoplafnpbcdgcgcajfjddcncgb"
+EXTENSION_START_MODE_AUTO_RUN = "auto-run"
+EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY = "registered-oauth-retry"
+EXTENSION_START_MODE_CHOICES = (
+    EXTENSION_START_MODE_AUTO_RUN,
+    EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY,
+)
 AUTO_RUN_BUTTON_SELECTOR = "#btn-auto-run"
 AUTO_RUN_NOW_BUTTON_SELECTOR = "#btn-auto-run-now"
 AUTO_START_MODAL_SELECTOR = "#auto-start-modal"
 AUTO_START_RESTART_BUTTON_SELECTOR = "#btn-auto-start-restart"
+REGISTERED_OAUTH_RETRY_BUTTON_SELECTOR = "#btn-registered-oauth-retry"
 EMAIL_INPUT_SELECTOR = "#input-email"
+PASSWORD_INPUT_SELECTOR = "#input-password"
 STATUS_BAR_SELECTOR = "#status-bar"
 STATUS_DISPLAY_SELECTOR = "#display-status"
 LOG_LINE_SELECTOR = "#log-area .log-line"
@@ -186,6 +194,51 @@ EXTENSION_START_SCRIPT_TEMPLATE = """
 
   autoRunButton.click();
   return 'clicked-auto-run';
+})()
+""".strip()
+
+EXTENSION_START_REGISTERED_OAUTH_RETRY_SCRIPT_TEMPLATE = """
+(() => {
+  const retryButton = document.querySelector(%(retry_button_selector)s);
+  if (!retryButton) {
+    return 'missing-registered-oauth-retry-button';
+  }
+
+  const emailInput = document.querySelector(%(email_input_selector)s);
+  if (!emailInput) {
+    return 'missing-email-input';
+  }
+
+  const passwordInput = document.querySelector(%(password_input_selector)s);
+  if (!passwordInput) {
+    return 'missing-password-input';
+  }
+
+  const email = (emailInput.value || '').trim();
+  if (!email) {
+    return 'missing-email';
+  }
+
+  const password = (passwordInput.value || '').trim();
+  if (!password) {
+    return 'missing-password';
+  }
+
+  try {
+    chrome.runtime.sendMessage({
+      type: 'START_REGISTERED_OAUTH_RETRY',
+      source: 'sidepanel',
+      payload: {
+        email,
+        password,
+      },
+    }).catch((error) => {
+      console.error('start-registered-oauth-retry-error', error);
+    });
+    return 'started';
+  } catch (error) {
+    return `start-registered-oauth-retry-error:${error?.message || String(error)}`;
+  }
 })()
 """.strip()
 

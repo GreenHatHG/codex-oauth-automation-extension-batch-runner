@@ -31,6 +31,8 @@ from chrome_runner.constants import (
     DEFAULT_PROXY_BLACKLIST_TTL_SECONDS,
     DEFAULT_PROFILE_BLACKLIST_TTL_SECONDS,
     DEFAULT_SMS_SOCKET_HOST,
+    EXTENSION_START_MODE_AUTO_RUN,
+    EXTENSION_START_MODE_CHOICES,
     PROFILE_BLACKLIST_SIGNAL_TEXTS,
     TARGET_EXTENSION_ID,
 )
@@ -71,12 +73,12 @@ DEFAULT_PROFILE_NAMES = (BASE_PROFILE_DIR_NAME,)
 DEFAULT_EMAILS_FILE_EXTRA_ROUNDS = 0
 MANUAL_PRE_RUN_CANCEL_INPUTS = frozenset({"q", "quit", "exit"})
 MANUAL_PRE_RUN_PROMPT = (
-    "请在当前 Chrome 完成前置操作，完成后按回车继续自动运行，"
+    "请在当前 Chrome 完成前置操作，完成后按回车继续扩展流程，"
     "输入 q 后回车取消本轮："
 )
-MANUAL_PRE_RUN_NOTICE = "自动运行前置：请在当前 Chrome 完成手动操作。"
-MANUAL_PRE_RUN_RESUME_NOTICE = "自动运行前置：收到继续指令，开始执行扩展。"
-MANUAL_PRE_RUN_CANCEL_MESSAGE = "已取消本轮自动运行。"
+MANUAL_PRE_RUN_NOTICE = "扩展启动前置：请在当前 Chrome 完成手动操作。"
+MANUAL_PRE_RUN_RESUME_NOTICE = "扩展启动前置：收到继续指令，开始执行扩展。"
+MANUAL_PRE_RUN_CANCEL_MESSAGE = "已取消本轮扩展执行。"
 MANUAL_PRE_RUN_STDIN_ERROR = "当前运行需要交互式终端，无法读取继续指令。"
 AUTO_MINIMIZE_DISABLED_HELP = (
     "自动运行时保持 Chrome 和扩展窗口可见。"
@@ -163,7 +165,7 @@ def parse_non_negative_int(raw_value: str) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="启动 Chrome，并可选地打开扩展页面后点击运行按钮。"
+        description="启动 Chrome，并可选地打开扩展页面后启动指定流程。"
     )
     parser.add_argument(
         "--profile",
@@ -243,6 +245,15 @@ def parse_args() -> argparse.Namespace:
         "--extension-id",
         default=TARGET_EXTENSION_ID,
         help="指定要运行的扩展 ID。",
+    )
+    parser.add_argument(
+        "--extension-start-mode",
+        default=EXTENSION_START_MODE_AUTO_RUN,
+        choices=EXTENSION_START_MODE_CHOICES,
+        help=(
+            "指定扩展启动模式。"
+            f"默认 {EXTENSION_START_MODE_AUTO_RUN}。"
+        ),
     )
     parser.add_argument(
         "--max-attempt-seconds",
@@ -898,6 +909,7 @@ def execute_single_run(
                 remote_debugging_port,
                 args.extension_id,
                 auto_minimize=should_auto_minimize(args),
+                start_mode=args.extension_start_mode,
                 max_attempt_seconds=args.max_attempt_seconds,
                 registration_email=registration_email,
                 snapshot_observer=(

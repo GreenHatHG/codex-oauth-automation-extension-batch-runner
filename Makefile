@@ -33,7 +33,7 @@ SMS_CODE_SUBMIT_SELECTOR ?= .verify_code_bottom > button
 	refresh-2925-extension \
 	clean-runtime-env \
 	run-2925-batch \
-	run-2925-email-file-batch \
+	run-2925-registered-oauth-batch \
 	init-temp-profile \
 	run-qq-sms-batch
 
@@ -45,7 +45,7 @@ help:
 	'  make refresh-2925-extension     # 给 2925 基准 profile 刷新本地解压扩展' \
 	'  make clean-runtime-env          # 清理临时 profile 和自动运行生成的 runtime 目录' \
 	'  make run-2925-batch            # 跑 2925 批量自动流程' \
-	'  make run-2925-email-file-batch # 按邮箱文件重跑 2925 自动流程' \
+	'  make run-2925-registered-oauth-batch # 按邮箱文件重走 2925 已注册账号 OAuth' \
 	'  make init-temp-profile         # 初始化一个全新的临时 profile' \
 	'  make run-qq-sms-batch          # 跑 QQ 短信验证码批量流程' \
 	'' \
@@ -61,8 +61,8 @@ help:
 	'' \
 	'覆盖示例：' \
 	'  make run-2925-batch BATCH_REPEAT_2925=10' \
-	'  make run-2925-email-file-batch EMAILS_FILE=emails.txt' \
-	'  make run-2925-email-file-batch EMAILS_FILE_EXTRA_ROUNDS=2' \
+	'  make run-2925-registered-oauth-batch EMAILS_FILE=emails.txt' \
+	'  make run-2925-registered-oauth-batch EMAILS_FILE_EXTRA_ROUNDS=2' \
 	'  make run-qq-sms-batch SMS_SOCKET_PORT=40000'
 
 # 从 2925 主 profile 复制出临时 profile，方便手动补充环境或验证设置。
@@ -95,10 +95,11 @@ run-2925-batch:
 		--profile-blacklist-ttl-seconds $(PROFILE_BLACKLIST_TTL_SECONDS) \
 		--max-attempt-seconds $(MAX_ATTEMPT_SECONDS)
 
-# 按邮箱文件逐条重跑 2925 自动流程，每个邮箱对应一轮。
-run-2925-email-file-batch:
+# 按邮箱文件逐条重走 2925 已注册账号 OAuth 流程，每个邮箱对应一轮。
+run-2925-registered-oauth-batch:
 	$(PYTHON) launch_fresh_chrome.py \
 		--run-extension \
+		--extension-start-mode registered-oauth-retry \
 		--emails-file $(EMAILS_FILE) \
 		--emails-file-extra-rounds $(EMAILS_FILE_EXTRA_ROUNDS) \
 		--clash-ai-switch-strategy $(CLASH_AI_SWITCH_STRATEGY) \

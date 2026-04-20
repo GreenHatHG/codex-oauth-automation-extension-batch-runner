@@ -17,9 +17,14 @@ from .constants import (
     BUTTON_CLICK_TIMEOUT_SECONDS,
     DEVTOOLS_POLL_INTERVAL_SECONDS,
     EMAIL_INPUT_SELECTOR,
+    EXTENSION_START_MODE_AUTO_RUN,
+    EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY,
+    EXTENSION_START_REGISTERED_OAUTH_RETRY_SCRIPT_TEMPLATE,
     FAILURE_STATUS_TEXTS,
     LOG_LINE_SELECTOR,
     PAGE_READY_TIMEOUT_SECONDS,
+    PASSWORD_INPUT_SELECTOR,
+    REGISTERED_OAUTH_RETRY_BUTTON_SELECTOR,
     START_PAGE_REUSE_TIMEOUT_SECONDS,
     RUN_MONITOR_POLL_INTERVAL_SECONDS,
     RUN_MONITOR_STAGNATION_TIMEOUT_SECONDS,
@@ -147,6 +152,86 @@ def click_extension_auto_run(
         raise RuntimeError(f"扩展自动运行状态异常: {result}")
 
     raise TimeoutError("未能确认扩展已进入自动运行状态。")
+
+
+def build_registered_oauth_retry_timeout_error(last_result: str) -> TimeoutError:
+    error_messages = {
+        "missing-registered-oauth-retry-button": (
+            "扩展页面缺少“重走 OAuth”按钮，无法启动已注册账号模式。"
+        ),
+        "missing-email-input": "扩展页面缺少邮箱输入框，无法启动已注册账号模式。",
+        "missing-password-input": "扩展页面缺少密码输入框，无法启动已注册账号模式。",
+        "missing-email": "扩展当前邮箱为空，无法启动已注册账号模式。",
+        "missing-password": "扩展当前密码为空，无法启动已注册账号模式。",
+    }
+    return TimeoutError(
+        error_messages.get(
+            last_result,
+            "未能在预期时间内启动已注册账号重走 OAuth 流程。",
+        )
+    )
+
+
+def start_extension_registered_oauth_retry(
+    devtools_client: DevToolsClient,
+    timeout_seconds: float = BUTTON_CLICK_TIMEOUT_SECONDS,
+) -> None:
+    deadline = time.time() + timeout_seconds
+    script = EXTENSION_START_REGISTERED_OAUTH_RETRY_SCRIPT_TEMPLATE % {
+        "retry_button_selector": json.dumps(
+            REGISTERED_OAUTH_RETRY_BUTTON_SELECTOR
+        ),
+        "email_input_selector": json.dumps(EMAIL_INPUT_SELECTOR),
+        "password_input_selector": json.dumps(PASSWORD_INPUT_SELECTOR),
+    }
+    retryable_results = frozenset(
+        {
+            "missing-registered-oauth-retry-button",
+            "missing-email-input",
+            "missing-password-input",
+            "missing-email",
+            "missing-password",
+        }
+    )
+    last_result = ""
+
+    while time.time() < deadline:
+        result = str(evaluate_javascript(devtools_client, script) or "")
+        if result == "started":
+            return
+        if result in retryable_results:
+            last_result = result
+            time.sleep(DEVTOOLS_POLL_INTERVAL_SECONDS)
+            continue
+        if result.startswith("start-registered-oauth-retry-error:"):
+            raise RuntimeError(
+                "启动已注册账号重走 OAuth 流程失败："
+                f"{result.removeprefix('start-registered-oauth-retry-error:')}"
+            )
+        raise RuntimeError(f"扩展重走 OAuth 启动状态异常: {result}")
+
+    raise build_registered_oauth_retry_timeout_error(last_result)
+
+
+def start_extension_flow(
+    devtools_client: DevToolsClient,
+    *,
+    start_mode: str,
+    timeout_seconds: float = BUTTON_CLICK_TIMEOUT_SECONDS,
+) -> None:
+    if start_mode == EXTENSION_START_MODE_AUTO_RUN:
+        click_extension_auto_run(
+            devtools_client,
+            timeout_seconds=timeout_seconds,
+        )
+        return
+    if start_mode == EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY:
+        start_extension_registered_oauth_retry(
+            devtools_client,
+            timeout_seconds=timeout_seconds,
+        )
+        return
+    raise RuntimeError(f"未知扩展启动模式: {start_mode}")
 
 
 def save_extension_registration_email(
@@ -481,6 +566,7 @@ def run_extension(
     extension_id: str,
     *,
     auto_minimize: bool = True,
+    start_mode: str = EXTENSION_START_MODE_AUTO_RUN,
     max_attempt_seconds: int | None = None,
     registration_email: str = "",
     snapshot_observer: SnapshotObserver | None = None,
@@ -577,8 +663,9 @@ def run_extension(
                         BUTTON_CLICK_TIMEOUT_SECONDS,
                     ),
                 )
-            click_extension_auto_run(
+            start_extension_flow(
                 devtools_client,
+                start_mode=start_mode,
                 timeout_seconds=resolve_operation_timeout_seconds(
                     attempt_started_at,
                     max_attempt_seconds,
