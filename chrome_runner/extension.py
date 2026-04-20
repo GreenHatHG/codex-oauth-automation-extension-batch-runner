@@ -16,6 +16,7 @@ from .constants import (
     AUTO_START_RESTART_BUTTON_SELECTOR,
     BUTTON_CLICK_TIMEOUT_SECONDS,
     DEVTOOLS_POLL_INTERVAL_SECONDS,
+    EMAIL_INPUT_SELECTOR,
     FAILURE_STATUS_TEXTS,
     LOG_LINE_SELECTOR,
     PAGE_READY_TIMEOUT_SECONDS,
@@ -29,6 +30,8 @@ from .constants import (
     STATUS_DISPLAY_SELECTOR,
     STEP_STATUS_SELECTOR,
     SUCCESS_STATUS_TEXTS,
+    EXTENSION_EMAIL_STATE_SCRIPT_TEMPLATE,
+    EXTENSION_SAVE_EMAIL_SCRIPT_TEMPLATE,
     EXTENSION_START_SCRIPT_TEMPLATE,
     EXTENSION_STATUS_SNAPSHOT_SCRIPT_TEMPLATE,
     DEVTOOLS_READY_TIMEOUT_SECONDS,
@@ -144,6 +147,74 @@ def click_extension_auto_run(
         raise RuntimeError(f"扩展自动运行状态异常: {result}")
 
     raise TimeoutError("未能确认扩展已进入自动运行状态。")
+
+
+def save_extension_registration_email(
+    devtools_client: DevToolsClient,
+    registration_email: str,
+    timeout_seconds: float = BUTTON_CLICK_TIMEOUT_SECONDS,
+) -> None:
+    normalized_email = registration_email.strip()
+    if not normalized_email:
+        raise RuntimeError("指定邮箱为空，无法写入扩展。")
+
+    save_script = EXTENSION_SAVE_EMAIL_SCRIPT_TEMPLATE % {
+        "email_input_selector": json.dumps(EMAIL_INPUT_SELECTOR),
+        "email_value": json.dumps(normalized_email, ensure_ascii=False),
+    }
+    state_script = EXTENSION_EMAIL_STATE_SCRIPT_TEMPLATE % {
+        "email_input_selector": json.dumps(EMAIL_INPUT_SELECTOR),
+    }
+
+    save_result = str(evaluate_javascript(devtools_client, save_script) or "")
+    if save_result == "missing-email-input":
+        raise RuntimeError("扩展页面缺少邮箱输入框，无法写入指定邮箱。")
+    if save_result == "empty-email":
+        raise RuntimeError("指定邮箱为空，无法写入扩展。")
+    if save_result.startswith("save-email-error:"):
+        raise RuntimeError(
+            f"扩展保存指定邮箱失败：{save_result.removeprefix('save-email-error:')}"
+        )
+    if save_result.startswith("save-email-runtime-error:"):
+        raise RuntimeError(
+            "扩展保存指定邮箱失败："
+            f"{save_result.removeprefix('save-email-runtime-error:')}"
+        )
+    if save_result != "saved":
+        raise RuntimeError(f"扩展保存指定邮箱状态异常: {save_result}")
+
+    deadline = time.time() + timeout_seconds
+    last_input_email = ""
+    last_state_email = ""
+    while time.time() < deadline:
+        payload = evaluate_javascript(devtools_client, state_script)
+        if isinstance(payload, dict):
+            error_message = str(payload.get("error", "")).strip()
+            if error_message:
+                raise RuntimeError(f"扩展读取当前邮箱状态失败：{error_message}")
+            has_email_input = bool(payload.get("hasEmailInput"))
+            if not has_email_input:
+                raise RuntimeError("扩展页面缺少邮箱输入框，无法确认指定邮箱。")
+            last_input_email = str(payload.get("inputEmail", "")).strip()
+            last_state_email = str(payload.get("stateEmail", "")).strip()
+            if (
+                last_input_email == normalized_email
+                and last_state_email == normalized_email
+            ):
+                print(
+                    "自动运行前置：已确认扩展当前邮箱："
+                    f"{normalized_email}"
+                )
+                return
+        time.sleep(DEVTOOLS_POLL_INTERVAL_SECONDS)
+
+    raise TimeoutError(
+        "未能在预期时间内确认扩展当前邮箱。"
+        f"目标邮箱：{normalized_email}；"
+        f"输入框：{last_input_email or '空'}；"
+        f"当前邮箱：{last_state_email or '空'}；"
+        "请检查扩展是否成功保存指定邮箱。"
+    )
 
 
 def capture_extension_snapshot(devtools_client: DevToolsClient) -> ExtensionSnapshot:
@@ -272,12 +343,16 @@ def monitor_extension_run(
     attempt_started_at: float,
     max_attempt_seconds: int | None = None,
     snapshot_observer: SnapshotObserver | None = None,
+    initial_email: str = "",
 ) -> ExtensionRunResult:
     snapshot = capture_extension_snapshot(devtools_client)
     last_snapshot = snapshot
     last_change_at = time.time()
     last_reported_status = ""
-    current_email = resolve_snapshot_current_email(snapshot)
+    current_email = resolve_snapshot_current_email(
+        snapshot,
+        previous_current_email=initial_email,
+    )
     if snapshot_observer is not None:
         snapshot_observer(
             snapshot,
@@ -407,6 +482,7 @@ def run_extension(
     *,
     auto_minimize: bool = True,
     max_attempt_seconds: int | None = None,
+    registration_email: str = "",
     snapshot_observer: SnapshotObserver | None = None,
 ) -> ExtensionRunResult:
     attempt_started_at = time.monotonic()
@@ -491,6 +567,16 @@ def run_extension(
                     PAGE_READY_TIMEOUT_SECONDS,
                 ),
             )
+            if registration_email.strip():
+                save_extension_registration_email(
+                    devtools_client,
+                    registration_email,
+                    timeout_seconds=resolve_operation_timeout_seconds(
+                        attempt_started_at,
+                        max_attempt_seconds,
+                        BUTTON_CLICK_TIMEOUT_SECONDS,
+                    ),
+                )
             click_extension_auto_run(
                 devtools_client,
                 timeout_seconds=resolve_operation_timeout_seconds(
@@ -503,6 +589,7 @@ def run_extension(
                 devtools_client,
                 attempt_started_at=attempt_started_at,
                 max_attempt_seconds=max_attempt_seconds,
+                initial_email=registration_email.strip(),
                 snapshot_observer=snapshot_observer,
             )
         finally:

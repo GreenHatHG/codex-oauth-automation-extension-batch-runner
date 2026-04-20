@@ -7,12 +7,11 @@ from collections.abc import Collection
 from pathlib import Path
 
 from .constants import CURRENT_EMAIL_LOG_PREFIX, FAILED_ADD_PHONE_EMAILS_FILE_NAME
+from .email_utils import EMAIL_ADDRESS_PATTERN
 
-EMAIL_LOCAL_PART_PATTERN = r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+"
-EMAIL_DOMAIN_PART_PATTERN = r"(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+"
 CURRENT_EMAIL_PATTERN = re.compile(
     rf"{re.escape(CURRENT_EMAIL_LOG_PREFIX)}\s*"
-    rf"({EMAIL_LOCAL_PART_PATTERN}@{EMAIL_DOMAIN_PART_PATTERN})"
+    rf"({EMAIL_ADDRESS_PATTERN})"
 )
 
 

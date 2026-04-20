@@ -25,6 +25,7 @@ from chrome_runner.clash import normalize_proxy_name, run_pre_run_clash_ai_switc
 from chrome_runner.constants import (
     ADD_PHONE_ERROR_SIGNAL_TEXTS,
     BASE_PROFILE_DIR_NAME,
+    BATCH_PROXY_FAILURE_BLACKLIST_THRESHOLD,
     DEFAULT_SMS_CODE_REGEX,
     DEFAULT_SMS_CODE_TIMEOUT_SECONDS,
     DEFAULT_PROXY_BLACKLIST_TTL_SECONDS,
@@ -34,6 +35,7 @@ from chrome_runner.constants import (
     TARGET_EXTENSION_ID,
 )
 from chrome_runner.devtools import close_browser_via_devtools
+from chrome_runner.email_utils import load_email_lines, save_email_lines
 from chrome_runner.extension import ExtensionRunResult, run_extension
 from chrome_runner.profile import (
     parse_profile_name,
@@ -66,6 +68,7 @@ CLASH_AI_SWITCH_STRATEGY_CHOICES = (
 )
 DEFAULT_CLASH_AI_SWITCH_REUSE_LIMIT = 5
 DEFAULT_PROFILE_NAMES = (BASE_PROFILE_DIR_NAME,)
+DEFAULT_EMAILS_FILE_EXTRA_ROUNDS = 0
 MANUAL_PRE_RUN_CANCEL_INPUTS = frozenset({"q", "quit", "exit"})
 MANUAL_PRE_RUN_PROMPT = (
     "请在当前 Chrome 完成前置操作，完成后按回车继续自动运行，"
@@ -120,6 +123,7 @@ class BatchProxyState:
 
     current_proxy_name: str = ""
     current_proxy_run_count: int = 0
+    failure_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -144,6 +148,16 @@ def parse_positive_int(raw_value: str) -> int:
         raise argparse.ArgumentTypeError("参数值必须是正整数。") from exc
     if parsed_value < 1:
         raise argparse.ArgumentTypeError("参数值必须是正整数。")
+    return parsed_value
+
+
+def parse_non_negative_int(raw_value: str) -> int:
+    try:
+        parsed_value = int(raw_value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("参数值必须是非负整数。") from exc
+    if parsed_value < 0:
+        raise argparse.ArgumentTypeError("参数值必须是非负整数。")
     return parsed_value
 
 
@@ -246,6 +260,21 @@ def parse_args() -> argparse.Namespace:
         help="按顺序重复执行指定次数。大于 1 时需要搭配 --run-extension。",
     )
     parser.add_argument(
+        "--emails-file",
+        type=Path,
+        default=None,
+        help="读取邮箱文件并按行批量执行。每行一个邮箱，空行会跳过，重复邮箱按首次出现保留。",
+    )
+    parser.add_argument(
+        "--emails-file-extra-rounds",
+        type=parse_non_negative_int,
+        default=DEFAULT_EMAILS_FILE_EXTRA_ROUNDS,
+        help=(
+            "邮箱文件模式下，首轮结束后额外继续跑剩余邮箱的轮数。"
+            f"默认 {DEFAULT_EMAILS_FILE_EXTRA_ROUNDS}。"
+        ),
+    )
+    parser.add_argument(
         "--sms-socket-host",
         default=DEFAULT_SMS_SOCKET_HOST,
         help="本地短信接收 socket 的监听地址。",
@@ -319,6 +348,67 @@ def build_init_profile_command(profile_name: str) -> str:
 def build_missing_profile_error(profile_dir: Path) -> str:
     init_command = build_init_profile_command(profile_dir.name)
     return f"{MISSING_PROFILE_MESSAGE}: {profile_dir}。请先运行：{init_command}"
+
+
+def load_batch_registration_emails(args: argparse.Namespace) -> tuple[str, ...]:
+    emails_file = getattr(args, "emails_file", None)
+    if emails_file is None:
+        return ()
+    return load_email_lines(Path(emails_file))
+
+
+def resolve_total_runs(
+    args: argparse.Namespace,
+    batch_registration_emails: Sequence[str],
+) -> int:
+    if batch_registration_emails:
+        return len(batch_registration_emails)
+    return args.repeat_count
+
+
+def resolve_emails_file_total_rounds(args: argparse.Namespace) -> int:
+    return getattr(args, "emails_file_extra_rounds", 0) + 1
+
+
+def build_emails_file_path(args: argparse.Namespace) -> Path | None:
+    emails_file = getattr(args, "emails_file", None)
+    if emails_file is None:
+        return None
+    return Path(emails_file).expanduser()
+
+
+def remove_email_from_pending_list(
+    pending_emails: list[str],
+    registration_email: str,
+) -> list[str]:
+    registration_email_key = registration_email.casefold()
+    for index, pending_email in enumerate(pending_emails):
+        if pending_email.casefold() == registration_email_key:
+            return [
+                *pending_emails[:index],
+                *pending_emails[index + 1 :],
+            ]
+    raise RuntimeError(f"待写回邮箱列表中找不到当前邮箱：{registration_email}")
+
+
+def persist_successful_email_removal(
+    args: argparse.Namespace,
+    pending_emails: list[str],
+    registration_email: str,
+) -> list[str]:
+    emails_file_path = build_emails_file_path(args)
+    if emails_file_path is None:
+        return pending_emails
+    next_pending_emails = remove_email_from_pending_list(
+        pending_emails,
+        registration_email,
+    )
+    save_email_lines(emails_file_path, next_pending_emails)
+    print(
+        f"邮箱文件已移除成功邮箱：{registration_email}；"
+        f"剩余 {len(next_pending_emails)} 个邮箱。"
+    )
+    return next_pending_emails
 
 
 def collect_missing_profile_dirs(
@@ -468,6 +558,10 @@ def maybe_reset_reused_proxy_for_blacklist(
         f"自动运行前置：当前复用节点 {current_proxy_name} 处于本地黑名单冷却期，"
         "准备切换新节点。"
     )
+    reset_batch_proxy_reuse_state(proxy_state)
+
+
+def reset_batch_proxy_reuse_state(proxy_state: BatchProxyState) -> None:
     proxy_state.current_proxy_name = ""
     proxy_state.current_proxy_run_count = 0
 
@@ -605,8 +699,7 @@ def update_batch_proxy_state(
 ) -> None:
     proxy_name = normalize_proxy_name(result.selected_proxy_name)
     if result.should_blacklist_selected_proxy or not result.succeeded:
-        proxy_state.current_proxy_name = ""
-        proxy_state.current_proxy_run_count = 0
+        reset_batch_proxy_reuse_state(proxy_state)
         return
     if not proxy_name:
         return
@@ -615,6 +708,51 @@ def update_batch_proxy_state(
         return
     proxy_state.current_proxy_name = proxy_name
     proxy_state.current_proxy_run_count = 1
+
+
+def record_batch_proxy_failure_count(
+    proxy_state: BatchProxyState,
+    *,
+    proxy_name: str,
+) -> int:
+    normalized_proxy_name = normalize_proxy_name(proxy_name)
+    if not normalized_proxy_name:
+        return 0
+    failure_count = proxy_state.failure_counts.get(normalized_proxy_name, 0) + 1
+    proxy_state.failure_counts[normalized_proxy_name] = failure_count
+    return failure_count
+
+
+def maybe_blacklist_batch_failed_proxy(
+    base_dir: Path,
+    proxy_state: BatchProxyState,
+    result: SingleRunResult,
+) -> None:
+    if result.succeeded or result.should_blacklist_selected_proxy:
+        return
+    proxy_name = normalize_proxy_name(result.selected_proxy_name)
+    if not proxy_name:
+        return
+    failure_count = record_batch_proxy_failure_count(
+        proxy_state,
+        proxy_name=proxy_name,
+    )
+    print(f"自动运行前置：节点 {proxy_name} 本次运行累计失败 {failure_count} 次。")
+    if failure_count < BATCH_PROXY_FAILURE_BLACKLIST_THRESHOLD:
+        return
+    is_new_entry = record_proxy_blacklist_hit(base_dir, proxy_name)
+    if is_new_entry:
+        print(
+            f"自动运行前置：节点 {proxy_name} 本次运行累计失败达到 "
+            f"{BATCH_PROXY_FAILURE_BLACKLIST_THRESHOLD} 次，已写入本地黑名单。"
+        )
+    else:
+        print(
+            f"自动运行前置：节点 {proxy_name} 本次运行累计失败再次达到 "
+            f"{BATCH_PROXY_FAILURE_BLACKLIST_THRESHOLD} 次，"
+            "已刷新本地黑名单时间。"
+        )
+    reset_batch_proxy_reuse_state(proxy_state)
 
 
 def maybe_record_selected_proxy_success(
@@ -687,6 +825,7 @@ def execute_single_run(
     base_dir: Path,
     base_profile_dir: Path,
     *,
+    registration_email: str = "",
     excluded_proxy_names: frozenset[str] = frozenset(),
     proxy_stats_entries: dict[str, ProxyStatsEntry] | None = None,
     current_proxy_name: str = "",
@@ -760,6 +899,7 @@ def execute_single_run(
                 args.extension_id,
                 auto_minimize=should_auto_minimize(args),
                 max_attempt_seconds=args.max_attempt_seconds,
+                registration_email=registration_email,
                 snapshot_observer=(
                     sms_code_automation.maybe_handle_snapshot
                     if sms_code_automation is not None
@@ -840,6 +980,8 @@ def validate_batch_args(
     args: argparse.Namespace,
     base_dir: Path,
     profile_names: Sequence[str],
+    *,
+    batch_registration_emails: Sequence[str],
 ) -> None:
     if (
         getattr(args, "pre_run_clash_ai_switch", False)
@@ -854,7 +996,14 @@ def validate_batch_args(
         raise RuntimeError("--sms-socket-port 需要搭配 --run-extension。")
     if args.max_attempt_seconds is not None and not args.run_extension:
         raise RuntimeError("--max-attempt-seconds 需要搭配 --run-extension。")
-    if args.repeat_count == 1:
+    if args.emails_file_extra_rounds > 0 and getattr(args, "emails_file", None) is None:
+        raise RuntimeError("--emails-file-extra-rounds 需要搭配 --emails-file。")
+    if batch_registration_emails and not args.run_extension:
+        raise RuntimeError("--emails-file 需要搭配 --run-extension。")
+    if batch_registration_emails and args.repeat_count > 1:
+        raise RuntimeError("--emails-file 模式下不支持同时指定大于 1 的 --repeat-count。")
+    total_runs = resolve_total_runs(args, batch_registration_emails)
+    if total_runs == 1:
         return
     if not args.run_extension:
         raise RuntimeError("多次运行模式需要搭配 --run-extension。")
@@ -870,8 +1019,14 @@ def format_duration(duration_seconds: float) -> str:
     return f"{duration_seconds:.1f} 秒"
 
 
-def print_attempt_result(result: RunAttemptResult, total_runs: int) -> None:
+def print_attempt_result(result: RunAttemptResult, total_runs: int | None) -> None:
     outcome_text = "成功" if result.succeeded else "失败"
+    if total_runs is None:
+        print(
+            f"第 {result.index} 轮结束：{outcome_text}，"
+            f"耗时 {format_duration(result.duration_seconds)}。"
+        )
+        return
     print(
         f"第 {result.index}/{total_runs} 轮结束：{outcome_text}，"
         f"耗时 {format_duration(result.duration_seconds)}。"
@@ -902,55 +1057,157 @@ def print_batch_summary(
         print(f"失败轮次 {result.index}: {result.summary_text}")
 
 
+def execute_batch_attempt(
+    args: argparse.Namespace,
+    base_dir: Path,
+    profile_names: Sequence[str],
+    *,
+    attempt_index: int,
+    total_runs: int | None,
+    registration_email: str,
+    pending_registration_emails: list[str],
+    proxy_state: BatchProxyState,
+    profile_state: BatchProfileState,
+) -> tuple[RunAttemptResult, list[str]]:
+    active_profile_blacklist = load_active_profile_blacklist(args, base_dir)
+    report_skipped_blacklisted_profiles(profile_names, active_profile_blacklist)
+    profile_name = choose_next_profile_name(
+        profile_names,
+        active_profile_blacklist,
+        profile_state,
+    )
+    base_profile_dir = build_base_profile_dir(base_dir, profile_name)
+    print(f"第 {attempt_index} 轮开始")
+    print(f"本轮基准 profile: {profile_name}")
+    if registration_email:
+        print(f"本轮指定邮箱: {registration_email}")
+    attempt_started_at = time.perf_counter()
+    proxy_selection_state = load_proxy_selection_state(args, base_dir)
+    maybe_reset_reused_proxy_for_blacklist(
+        proxy_state,
+        proxy_selection_state.blacklisted_proxy_names,
+    )
+    should_switch_proxy = should_switch_proxy_for_batch_attempt(args, proxy_state)
+    if not should_switch_proxy:
+        maybe_report_reused_proxy_for_batch_attempt(args, proxy_state)
+    single_run_result = execute_single_run(
+        args,
+        base_dir,
+        base_profile_dir,
+        registration_email=registration_email,
+        excluded_proxy_names=proxy_selection_state.blacklisted_proxy_names,
+        proxy_stats_entries=proxy_selection_state.stats_entries,
+        current_proxy_name=proxy_state.current_proxy_name,
+        should_switch_proxy=should_switch_proxy,
+    )
+    maybe_blacklist_batch_failed_proxy(
+        base_dir,
+        proxy_state,
+        single_run_result,
+    )
+    if registration_email and single_run_result.succeeded:
+        try:
+            pending_registration_emails = persist_successful_email_removal(
+                args,
+                pending_registration_emails,
+                registration_email,
+            )
+        except Exception as exc:  # noqa: BLE001
+            single_run_result = SingleRunResult(
+                exit_code=1,
+                summary_text=(
+                    "启动失败: 成功邮箱写回邮箱文件失败："
+                    f"{exc}"
+                ),
+                selected_proxy_name=single_run_result.selected_proxy_name,
+                selected_proxy_delay_ms=single_run_result.selected_proxy_delay_ms,
+                should_blacklist_selected_proxy=(
+                    single_run_result.should_blacklist_selected_proxy
+                ),
+            )
+    update_batch_proxy_state(proxy_state, single_run_result)
+    duration_seconds = time.perf_counter() - attempt_started_at
+    result = RunAttemptResult(
+        index=attempt_index,
+        exit_code=single_run_result.exit_code,
+        duration_seconds=duration_seconds,
+        summary_text=single_run_result.summary_text,
+    )
+    print_attempt_result(result, total_runs)
+    return result, pending_registration_emails
+
+
 def run_batch(
     args: argparse.Namespace,
     base_dir: Path,
     profile_names: Sequence[str],
+    *,
+    batch_registration_emails: Sequence[str] = (),
 ) -> int:
     results: list[RunAttemptResult] = []
     batch_started_at = time.perf_counter()
     proxy_state = BatchProxyState()
     profile_state = BatchProfileState()
-
-    for attempt_index in range(1, args.repeat_count + 1):
-        active_profile_blacklist = load_active_profile_blacklist(args, base_dir)
-        report_skipped_blacklisted_profiles(profile_names, active_profile_blacklist)
-        profile_name = choose_next_profile_name(
-            profile_names,
-            active_profile_blacklist,
-            profile_state,
+    if batch_registration_emails:
+        total_rounds = resolve_emails_file_total_rounds(args)
+        pending_registration_emails = list(batch_registration_emails)
+        print(
+            f"邮箱文件模式：首轮加载 {len(batch_registration_emails)} 个邮箱；"
+            f"首轮后额外继续跑剩余邮箱 {total_rounds - 1} 轮。"
         )
-        base_profile_dir = build_base_profile_dir(base_dir, profile_name)
-        print(f"第 {attempt_index}/{args.repeat_count} 轮开始")
-        print(f"本轮基准 profile: {profile_name}")
-        attempt_started_at = time.perf_counter()
-        proxy_selection_state = load_proxy_selection_state(args, base_dir)
-        maybe_reset_reused_proxy_for_blacklist(
-            proxy_state,
-            proxy_selection_state.blacklisted_proxy_names,
-        )
-        should_switch_proxy = should_switch_proxy_for_batch_attempt(args, proxy_state)
-        if not should_switch_proxy:
-            maybe_report_reused_proxy_for_batch_attempt(args, proxy_state)
-        single_run_result = execute_single_run(
-            args,
-            base_dir,
-            base_profile_dir,
-            excluded_proxy_names=proxy_selection_state.blacklisted_proxy_names,
-            proxy_stats_entries=proxy_selection_state.stats_entries,
-            current_proxy_name=proxy_state.current_proxy_name,
-            should_switch_proxy=should_switch_proxy,
-        )
-        update_batch_proxy_state(proxy_state, single_run_result)
-        duration_seconds = time.perf_counter() - attempt_started_at
-        result = RunAttemptResult(
-            index=attempt_index,
-            exit_code=single_run_result.exit_code,
-            duration_seconds=duration_seconds,
-            summary_text=single_run_result.summary_text,
-        )
-        results.append(result)
-        print_attempt_result(result, args.repeat_count)
+        attempt_index = 0
+        for round_index in range(1, total_rounds + 1):
+            current_round_emails = tuple(pending_registration_emails)
+            if not current_round_emails:
+                print(
+                    f"邮箱文件模式：第 {round_index}/{total_rounds} 轮开始前已无剩余邮箱，"
+                    "提前结束。"
+                )
+                break
+            print(
+                f"邮箱文件模式：开始第 {round_index}/{total_rounds} 轮，"
+                f"当前剩余 {len(current_round_emails)} 个邮箱。"
+            )
+            for registration_email in current_round_emails:
+                attempt_index += 1
+                result, pending_registration_emails = execute_batch_attempt(
+                    args,
+                    base_dir,
+                    profile_names,
+                    attempt_index=attempt_index,
+                    total_runs=None,
+                    registration_email=registration_email,
+                    pending_registration_emails=pending_registration_emails,
+                    proxy_state=proxy_state,
+                    profile_state=profile_state,
+                )
+                results.append(result)
+            print(
+                f"邮箱文件模式：第 {round_index}/{total_rounds} 轮结束，"
+                f"剩余 {len(pending_registration_emails)} 个邮箱。"
+            )
+        if pending_registration_emails:
+            print(
+                f"邮箱文件模式：已达到最大轮数，仍剩 "
+                f"{len(pending_registration_emails)} 个邮箱待后续继续执行。"
+            )
+    else:
+        total_runs = resolve_total_runs(args, batch_registration_emails)
+        registration_emails = tuple("" for _ in range(total_runs))
+        pending_registration_emails = list(registration_emails)
+        for attempt_index, registration_email in enumerate(registration_emails, start=1):
+            result, pending_registration_emails = execute_batch_attempt(
+                args,
+                base_dir,
+                profile_names,
+                attempt_index=attempt_index,
+                total_runs=total_runs,
+                registration_email=registration_email,
+                pending_registration_emails=pending_registration_emails,
+                proxy_state=proxy_state,
+                profile_state=profile_state,
+            )
+            results.append(result)
 
     total_duration_seconds = time.perf_counter() - batch_started_at
     print_batch_summary(results, total_duration_seconds=total_duration_seconds)
@@ -963,14 +1220,26 @@ def main() -> int:
     profile_names = resolve_profile_names(args)
 
     try:
-        validate_batch_args(args, base_dir, profile_names)
+        batch_registration_emails = load_batch_registration_emails(args)
+        validate_batch_args(
+            args,
+            base_dir,
+            profile_names,
+            batch_registration_emails=batch_registration_emails,
+        )
     except Exception as exc:  # noqa: BLE001
         print(f"启动失败: {exc}", file=sys.stderr)
         return 1
 
-    if args.repeat_count > 1:
+    total_runs = resolve_total_runs(args, batch_registration_emails)
+    if batch_registration_emails or total_runs > 1:
         try:
-            return run_batch(args, base_dir, profile_names)
+            return run_batch(
+                args,
+                base_dir,
+                profile_names,
+                batch_registration_emails=batch_registration_emails,
+            )
         except KeyboardInterrupt:
             print(INTERRUPTED_MESSAGE, file=sys.stderr)
             return INTERRUPTED_EXIT_CODE
@@ -1004,6 +1273,7 @@ def main() -> int:
             args,
             base_dir,
             base_profile_dir,
+            registration_email="",
             excluded_proxy_names=proxy_selection_state.blacklisted_proxy_names,
             proxy_stats_entries=proxy_selection_state.stats_entries,
         )

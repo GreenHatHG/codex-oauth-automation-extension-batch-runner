@@ -46,6 +46,7 @@ CLASH_AI_SWITCH_ERROR_PREFIX = "自动运行前置动作执行失败："
 DEFAULT_LOCAL_BLACKLIST_TTL_SECONDS = 12 * 60 * 60
 PROXY_BLACKLIST_FILE_NAME = ".proxy-blacklist.json"
 DEFAULT_PROXY_BLACKLIST_TTL_SECONDS = DEFAULT_LOCAL_BLACKLIST_TTL_SECONDS
+BATCH_PROXY_FAILURE_BLACKLIST_THRESHOLD = 2
 PROXY_STATS_FILE_NAME = ".proxy-stats.json"
 PROFILE_BLACKLIST_FILE_NAME = ".profile-blacklist.json"
 DEFAULT_PROFILE_BLACKLIST_TTL_SECONDS = DEFAULT_LOCAL_BLACKLIST_TTL_SECONDS
@@ -117,6 +118,7 @@ AUTO_RUN_BUTTON_SELECTOR = "#btn-auto-run"
 AUTO_RUN_NOW_BUTTON_SELECTOR = "#btn-auto-run-now"
 AUTO_START_MODAL_SELECTOR = "#auto-start-modal"
 AUTO_START_RESTART_BUTTON_SELECTOR = "#btn-auto-start-restart"
+EMAIL_INPUT_SELECTOR = "#input-email"
 STATUS_BAR_SELECTOR = "#status-bar"
 STATUS_DISPLAY_SELECTOR = "#display-status"
 LOG_LINE_SELECTOR = "#log-area .log-line"
@@ -184,6 +186,71 @@ EXTENSION_START_SCRIPT_TEMPLATE = """
 
   autoRunButton.click();
   return 'clicked-auto-run';
+})()
+""".strip()
+
+EXTENSION_SAVE_EMAIL_SCRIPT_TEMPLATE = """
+(async () => {
+  const emailInput = document.querySelector(%(email_input_selector)s);
+  if (!emailInput) {
+    return 'missing-email-input';
+  }
+
+  const nextEmail = %(email_value)s;
+  if (!nextEmail) {
+    return 'empty-email';
+  }
+
+  const inputPrototype = window.HTMLInputElement?.prototype;
+  const valueSetter = inputPrototype
+    ? Object.getOwnPropertyDescriptor(inputPrototype, 'value')?.set
+    : null;
+  if (valueSetter) {
+    valueSetter.call(emailInput, nextEmail);
+  } else {
+    emailInput.value = nextEmail;
+  }
+  emailInput.dispatchEvent(new Event('input', { bubbles: true }));
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: 'SAVE_EMAIL',
+      source: 'sidepanel',
+      payload: { email: nextEmail },
+    });
+    if (response?.error) {
+      return `save-email-error:${response.error}`;
+    }
+  } catch (error) {
+    return `save-email-runtime-error:${error?.message || String(error)}`;
+  }
+
+  return 'saved';
+})()
+""".strip()
+
+EXTENSION_EMAIL_STATE_SCRIPT_TEMPLATE = """
+(async () => {
+  const emailInput = document.querySelector(%(email_input_selector)s);
+
+  try {
+    const state = await chrome.runtime.sendMessage({
+      type: 'GET_STATE',
+      source: 'sidepanel',
+    });
+    return {
+      inputEmail: (emailInput?.value || '').trim(),
+      hasEmailInput: Boolean(emailInput),
+      stateEmail: String(state?.email || '').trim(),
+    };
+  } catch (error) {
+    return {
+      error: error?.message || String(error),
+      inputEmail: (emailInput?.value || '').trim(),
+      hasEmailInput: Boolean(emailInput),
+      stateEmail: '',
+    };
+  }
 })()
 """.strip()
 
