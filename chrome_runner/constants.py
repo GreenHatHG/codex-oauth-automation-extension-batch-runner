@@ -59,6 +59,8 @@ PROFILE_MAILBOX_SITE_REFERENCES = (
     "wx.mail.qq.com",
 )
 PROFILE_PREFERENCES_RELATIVE_PATH = ("Default", "Preferences")
+FAILED_ADD_PHONE_EMAILS_FILE_NAME = "failed_add_phone_emails.txt"
+CURRENT_EMAIL_LOG_PREFIX = "当前邮箱："
 
 CHROME_FLAGS = (
     "--no-first-run",

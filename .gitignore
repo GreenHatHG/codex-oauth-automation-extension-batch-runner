@@ -4,3 +4,4 @@ __pycache__/
 .proxy-blacklist.json
 .profile-blacklist.json
 .proxy-stats.json
+failed_add_phone_emails.txt

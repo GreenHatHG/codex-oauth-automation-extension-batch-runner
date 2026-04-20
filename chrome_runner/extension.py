@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .add_phone_failure import extract_latest_current_email
 from .constants import (
     AUTO_RUN_BUTTON_SELECTOR,
     AUTO_RUN_NOW_BUTTON_SELECTOR,
@@ -74,6 +75,7 @@ class ExtensionRunResult:
     status_text: str
     timeout_seconds: float = 0.0
     recent_logs: tuple[str, ...] = ()
+    current_email: str = ""
 
 
 SnapshotObserver = Callable[[ExtensionSnapshot, float | None], None]
@@ -81,6 +83,20 @@ SnapshotObserver = Callable[[ExtensionSnapshot, float | None], None]
 
 class AttemptTimeoutError(TimeoutError):
     """Raised when a single automatic run exceeds the configured attempt limit."""
+
+
+def build_snapshot_messages(snapshot: ExtensionSnapshot) -> tuple[str, ...]:
+    return (snapshot.status_text, *snapshot.recent_logs)
+
+
+def resolve_snapshot_current_email(
+    snapshot: ExtensionSnapshot,
+    previous_current_email: str = "",
+) -> str:
+    current_email = extract_latest_current_email(build_snapshot_messages(snapshot))
+    if current_email:
+        return current_email
+    return previous_current_email
 
 
 def wait_for_extension_ready(
@@ -175,14 +191,20 @@ def classify_extension_snapshot(
     snapshot: ExtensionSnapshot,
     *,
     stagnant_seconds: float,
+    current_email: str = "",
 ) -> ExtensionRunResult | None:
     if any(text in snapshot.status_text for text in SUCCESS_STATUS_TEXTS):
-        return ExtensionRunResult("success", snapshot.status_text)
+        return ExtensionRunResult(
+            "success",
+            snapshot.status_text,
+            current_email=current_email,
+        )
     if any(text in snapshot.status_text for text in FAILURE_STATUS_TEXTS):
         return ExtensionRunResult(
             "failure",
             snapshot.status_text,
             recent_logs=snapshot.recent_logs,
+            current_email=current_email,
         )
     if stagnant_seconds >= RUN_MONITOR_STAGNATION_TIMEOUT_SECONDS:
         status_text = snapshot.status_text or "状态长期无变化"
@@ -191,6 +213,7 @@ def classify_extension_snapshot(
             status_text,
             timeout_seconds=stagnant_seconds,
             recent_logs=snapshot.recent_logs,
+            current_email=current_email,
         )
     return None
 
@@ -209,12 +232,14 @@ def build_attempt_timeout_result(
     *,
     timeout_seconds: int,
     recent_logs: tuple[str, ...] = (),
+    current_email: str = "",
 ) -> ExtensionRunResult:
     return ExtensionRunResult(
         "attempt_timeout",
         status_text or "单轮运行时间达到上限",
         timeout_seconds=timeout_seconds,
         recent_logs=recent_logs,
+        current_email=current_email,
     )
 
 
@@ -252,6 +277,7 @@ def monitor_extension_run(
     last_snapshot = snapshot
     last_change_at = time.time()
     last_reported_status = ""
+    current_email = resolve_snapshot_current_email(snapshot)
     if snapshot_observer is not None:
         snapshot_observer(
             snapshot,
@@ -271,6 +297,7 @@ def monitor_extension_run(
         outcome = classify_extension_snapshot(
             last_snapshot,
             stagnant_seconds=stagnant_seconds,
+            current_email=current_email,
         )
         if outcome is not None:
             return outcome
@@ -279,6 +306,7 @@ def monitor_extension_run(
                 last_snapshot.status_text or "状态未知",
                 timeout_seconds=max_attempt_seconds or 0,
                 recent_logs=last_snapshot.recent_logs,
+                current_email=current_email,
             )
 
         sleep_seconds = RUN_MONITOR_POLL_INTERVAL_SECONDS
@@ -291,6 +319,7 @@ def monitor_extension_run(
                     last_snapshot.status_text or "状态未知",
                     timeout_seconds=max_attempt_seconds,
                     recent_logs=last_snapshot.recent_logs,
+                    current_email=current_email,
                 )
             sleep_seconds = min(sleep_seconds, remaining_seconds)
         time.sleep(sleep_seconds)
@@ -298,6 +327,10 @@ def monitor_extension_run(
         if snapshot.fingerprint != last_snapshot.fingerprint:
             last_snapshot = snapshot
             last_change_at = time.time()
+            current_email = resolve_snapshot_current_email(
+                snapshot,
+                previous_current_email=current_email,
+            )
             if snapshot_observer is not None:
                 snapshot_observer(
                     snapshot,

@@ -10,6 +10,7 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from chrome_runner.add_phone_failure import record_failed_add_phone_email
 from chrome_runner.chrome import (
     build_command,
     build_runtime_profile_dir,
@@ -382,7 +383,7 @@ def has_any_signal_text(messages: Collection[str], signal_texts: Collection[str]
     )
 
 
-def should_blacklist_proxy_for_add_phone(result: ExtensionRunResult) -> bool:
+def did_hit_add_phone_failure(result: ExtensionRunResult) -> bool:
     if result.outcome != "failure":
         return False
     return has_any_signal_text(
@@ -418,6 +419,24 @@ def maybe_record_selected_proxy_blacklist(
         print(f"自动运行前置：节点已写入本地黑名单：{proxy_name}")
         return
     print(f"自动运行前置：节点再次命中 add-phone，已刷新本地黑名单时间：{proxy_name}")
+
+
+def maybe_record_failed_add_phone_email(
+    base_dir: Path,
+    *,
+    failed_email: str,
+    should_record_failed_email: bool,
+) -> None:
+    if not should_record_failed_email:
+        return
+    if not failed_email:
+        print("自动运行前置：命中 add-phone，但没有提取到当前邮箱。")
+        return
+    is_new_entry = record_failed_add_phone_email(base_dir, failed_email)
+    if is_new_entry:
+        print(f"自动运行前置：add-phone 失败邮箱已写入文件：{failed_email}")
+        return
+    print(f"自动运行前置：add-phone 失败邮箱已存在，跳过重复写入：{failed_email}")
 
 
 def maybe_record_profile_blacklist(
@@ -748,9 +767,10 @@ def execute_single_run(
                 ),
             )
             exit_code, summary_text = report_extension_result(result)
+            hit_add_phone_failure = did_hit_add_phone_failure(result)
             should_blacklist_selected_proxy = (
                 bool(selected_proxy_name)
-                and should_blacklist_proxy_for_add_phone(result)
+                and hit_add_phone_failure
             )
             if result.outcome == "success":
                 maybe_record_selected_proxy_success(
@@ -765,6 +785,11 @@ def execute_single_run(
                 base_dir,
                 proxy_name=selected_proxy_name,
                 should_blacklist_proxy=should_blacklist_selected_proxy,
+            )
+            maybe_record_failed_add_phone_email(
+                base_dir,
+                failed_email=result.current_email,
+                should_record_failed_email=hit_add_phone_failure,
             )
             maybe_record_profile_blacklist(
                 base_dir,
