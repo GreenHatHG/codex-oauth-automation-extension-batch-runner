@@ -25,8 +25,10 @@ from chrome_runner.devtools import (
     wait_for_devtools_ready,
 )
 from chrome_runner.extension import (
-    build_extension_page_url,
     create_extension_target,
+)
+from chrome_runner.extension_source import (
+    build_extension_page_url,
     load_json_file,
     read_extension_settings,
 )

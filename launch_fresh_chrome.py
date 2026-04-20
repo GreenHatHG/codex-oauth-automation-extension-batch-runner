@@ -36,7 +36,7 @@ from chrome_runner.devtools import close_browser_via_devtools
 from chrome_runner.extension import ExtensionRunResult, run_extension
 from chrome_runner.profile import (
     parse_profile_name,
-    profile_uses_2925_mailbox,
+    profile_uses_blacklistable_mailbox,
     resolve_profile_dir,
 )
 from chrome_runner.profile_blacklist import (
@@ -201,7 +201,7 @@ def parse_args() -> argparse.Namespace:
         type=parse_positive_int,
         default=DEFAULT_PROFILE_BLACKLIST_TTL_SECONDS,
         help=(
-            "本地 profile 黑名单冷却时长。2925 邮箱 profile 命中子账号数量上限通知后，"
+            "本地 profile 黑名单冷却时长。邮箱 profile 命中邮箱侧限制日志后，"
             "达到该秒数前都会被跳过。"
             f"默认 {DEFAULT_PROFILE_BLACKLIST_TTL_SECONDS} 秒。"
         ),
@@ -391,12 +391,12 @@ def should_blacklist_proxy_for_add_phone(result: ExtensionRunResult) -> bool:
     )
 
 
-def should_blacklist_profile_for_limit_notice(
+def should_blacklist_profile_for_mailbox_signal(
     result: ExtensionRunResult,
     *,
-    uses_2925_mailbox: bool,
+    uses_blacklistable_mailbox: bool,
 ) -> bool:
-    if not uses_2925_mailbox:
+    if not uses_blacklistable_mailbox:
         return False
     return has_any_signal_text(
         build_extension_result_messages(result),
@@ -433,7 +433,7 @@ def maybe_record_profile_blacklist(
         print(f"自动运行前置：profile 已写入本地黑名单：{profile_name}")
         return
     print(
-        f"自动运行前置：profile 再次命中子账号数量上限通知，"
+        f"自动运行前置：profile 再次命中邮箱侧限制日志，"
         f"已刷新本地黑名单时间：{profile_name}"
     )
 
@@ -682,7 +682,7 @@ def execute_single_run(
     summary_text = ""
     cleanup_error: Exception | None = None
     profile_name = base_profile_dir.name
-    uses_2925_mailbox = profile_uses_2925_mailbox(base_profile_dir)
+    uses_blacklistable_mailbox = profile_uses_blacklistable_mailbox(base_profile_dir)
     if should_switch_proxy is None:
         should_switch_proxy = should_enable_clash_ai_switch(args)
     selected_proxy_name = (
@@ -757,9 +757,9 @@ def execute_single_run(
                     base_dir,
                     proxy_name=selected_proxy_name,
                 )
-            should_blacklist_profile = should_blacklist_profile_for_limit_notice(
+            should_blacklist_profile = should_blacklist_profile_for_mailbox_signal(
                 result,
-                uses_2925_mailbox=uses_2925_mailbox,
+                uses_blacklistable_mailbox=uses_blacklistable_mailbox,
             )
             maybe_record_selected_proxy_blacklist(
                 base_dir,

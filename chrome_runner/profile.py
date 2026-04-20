@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .constants import PROFILE_2925_DOMAIN, PROFILE_PREFERENCES_RELATIVE_PATH
+from .constants import PROFILE_MAILBOX_SITE_REFERENCES, PROFILE_PREFERENCES_RELATIVE_PATH
 
 INVALID_PROFILE_NAME_MESSAGE = "profile 名称必须是项目目录下的子目录名。"
 
@@ -34,5 +34,8 @@ def profile_contains_site_reference(profile_dir: Path, site_reference: str) -> b
     return site_reference in preferences_path.read_text(encoding="utf-8")
 
 
-def profile_uses_2925_mailbox(profile_dir: Path) -> bool:
-    return profile_contains_site_reference(profile_dir, PROFILE_2925_DOMAIN)
+def profile_uses_blacklistable_mailbox(profile_dir: Path) -> bool:
+    return any(
+        profile_contains_site_reference(profile_dir, site_reference)
+        for site_reference in PROFILE_MAILBOX_SITE_REFERENCES
+    )

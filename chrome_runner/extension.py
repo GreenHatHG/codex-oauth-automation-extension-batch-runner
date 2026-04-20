@@ -18,6 +18,7 @@ from .constants import (
     FAILURE_STATUS_TEXTS,
     LOG_LINE_SELECTOR,
     PAGE_READY_TIMEOUT_SECONDS,
+    START_PAGE_REUSE_TIMEOUT_SECONDS,
     RUN_MONITOR_POLL_INTERVAL_SECONDS,
     RUN_MONITOR_STAGNATION_TIMEOUT_SECONDS,
     EXTENSION_RESULT_LOG_LINE_LIMIT,
@@ -36,8 +37,10 @@ from .devtools import (
     evaluate_javascript,
     fetch_browser_websocket_url,
     wait_for_devtools_ready,
+    wait_for_page_websocket_url,
     wait_for_target_websocket_url,
 )
+from .extension_source import build_extension_page_url
 
 
 @dataclass(frozen=True)
@@ -76,83 +79,8 @@ class ExtensionRunResult:
 SnapshotObserver = Callable[[ExtensionSnapshot, float | None], None]
 
 
-def load_json_file(file_path: Path) -> dict[str, object]:
-    return json.loads(file_path.read_text(encoding="utf-8"))
-
-
 class AttemptTimeoutError(TimeoutError):
     """Raised when a single automatic run exceeds the configured attempt limit."""
-
-
-def read_extension_settings(profile_dir: Path, extension_id: str) -> dict[str, object]:
-    secure_preferences_path = profile_dir / "Default" / "Secure Preferences"
-    secure_preferences = load_json_file(secure_preferences_path)
-    return (
-        secure_preferences.get("extensions", {})
-        .get("settings", {})
-        .get(extension_id, {})
-    )
-
-
-def read_manifest_from_directory(extension_dir: Path) -> dict[str, object]:
-    manifest_path = extension_dir / "manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"找不到扩展 manifest 文件: {manifest_path}")
-    return load_json_file(manifest_path)
-
-
-def find_unpacked_extension_dir(profile_dir: Path, extension_id: str) -> Path | None:
-    extension_settings = read_extension_settings(profile_dir, extension_id)
-    extension_path = str(extension_settings.get("path", "")).strip()
-    if not extension_path:
-        return None
-
-    source_path = Path(extension_path).expanduser()
-    if not source_path.is_dir():
-        raise FileNotFoundError(f"找不到扩展源码目录: {source_path}")
-    read_manifest_from_directory(source_path)
-    return source_path
-
-
-def find_installed_extension_dir(profile_dir: Path, extension_id: str) -> Path | None:
-    extension_versions_dir = profile_dir / "Default" / "Extensions" / extension_id
-    if not extension_versions_dir.is_dir():
-        return None
-
-    version_dirs = sorted(
-        (path for path in extension_versions_dir.iterdir() if path.is_dir()),
-        key=lambda path: path.name,
-        reverse=True,
-    )
-    for version_dir in version_dirs:
-        if (version_dir / "manifest.json").is_file():
-            return version_dir
-    return None
-
-
-def read_extension_source_path(profile_dir: Path, extension_id: str) -> Path:
-    unpacked_extension_dir = find_unpacked_extension_dir(profile_dir, extension_id)
-    if unpacked_extension_dir is not None:
-        return unpacked_extension_dir
-
-    installed_extension_dir = find_installed_extension_dir(profile_dir, extension_id)
-    if installed_extension_dir is not None:
-        return installed_extension_dir
-
-    raise FileNotFoundError(
-        "在基准配置中找不到目标扩展安装目录。"
-        f"扩展 ID: {extension_id}"
-    )
-
-
-def build_extension_page_url(profile_dir: Path, extension_id: str) -> str:
-    extension_source_path = read_extension_source_path(profile_dir, extension_id)
-    manifest = read_manifest_from_directory(extension_source_path)
-    side_panel = manifest.get("side_panel", {})
-    side_panel_path = side_panel.get("default_path") if isinstance(side_panel, dict) else ""
-    if not side_panel_path:
-        raise RuntimeError("目标扩展没有配置 side_panel.default_path。")
-    return f"chrome-extension://{extension_id}/{side_panel_path}"
 
 
 def wait_for_extension_ready(
@@ -389,13 +317,13 @@ def create_extension_target(
     extension_url: str,
     *,
     auto_minimize: bool = True,
+    new_window: bool = True,
     timeout_seconds: float = DEVTOOLS_READY_TIMEOUT_SECONDS,
 ) -> str:
-    target_params: dict[str, object] = {
-        "url": extension_url,
-        "newWindow": True,
-    }
-    if auto_minimize:
+    target_params: dict[str, object] = {"url": extension_url}
+    if new_window:
+        target_params["newWindow"] = True
+    if auto_minimize and new_window:
         target_params["windowState"] = "minimized"
     response = browser_devtools_client.call(
         "Target.createTarget",
@@ -412,6 +340,31 @@ def create_extension_target(
         target_id,
         timeout_seconds=timeout_seconds,
     )
+
+
+def find_reusable_start_page_websocket_url(
+    devtools_port: int,
+    timeout_seconds: float = START_PAGE_REUSE_TIMEOUT_SECONDS,
+) -> str | None:
+    try:
+        return wait_for_page_websocket_url(
+            devtools_port,
+            include_url_substring="about:blank",
+            timeout_seconds=timeout_seconds,
+        )
+    except TimeoutError:
+        return None
+
+
+def navigate_to_extension_page(
+    devtools_client: DevToolsClient,
+    extension_url: str,
+    timeout_seconds: float = PAGE_READY_TIMEOUT_SECONDS,
+) -> None:
+    response = devtools_client.call("Page.navigate", {"url": extension_url})
+    if response.get("error"):
+        raise RuntimeError(f"跳转扩展目标页失败: {response['error']}")
+    devtools_client.wait_for_event("Page.loadEventFired", timeout_seconds)
 
 
 def run_extension(
@@ -444,17 +397,34 @@ def run_extension(
             ),
         )
         try:
-            websocket_url = create_extension_target(
-                browser_devtools_client,
-                devtools_port,
-                extension_url,
-                auto_minimize=auto_minimize,
-                timeout_seconds=resolve_operation_timeout_seconds(
-                    attempt_started_at,
-                    max_attempt_seconds,
-                    DEVTOOLS_READY_TIMEOUT_SECONDS,
-                ),
+            target_timeout_seconds = resolve_operation_timeout_seconds(
+                attempt_started_at,
+                max_attempt_seconds,
+                DEVTOOLS_READY_TIMEOUT_SECONDS,
             )
+            should_navigate_existing_page = False
+            websocket_url = ""
+            if not auto_minimize:
+                websocket_url = (
+                    find_reusable_start_page_websocket_url(
+                        devtools_port,
+                        timeout_seconds=min(
+                            target_timeout_seconds,
+                            START_PAGE_REUSE_TIMEOUT_SECONDS,
+                        ),
+                    )
+                    or ""
+                )
+                should_navigate_existing_page = bool(websocket_url)
+            if not websocket_url:
+                websocket_url = create_extension_target(
+                    browser_devtools_client,
+                    devtools_port,
+                    extension_url,
+                    auto_minimize=auto_minimize,
+                    new_window=auto_minimize,
+                    timeout_seconds=target_timeout_seconds,
+                )
             devtools_client = DevToolsClient(
                 websocket_url,
                 timeout_seconds=resolve_operation_timeout_seconds(
@@ -470,6 +440,16 @@ def run_extension(
         try:
             devtools_client.call("Page.enable")
             devtools_client.call("Runtime.enable")
+            if should_navigate_existing_page:
+                navigate_to_extension_page(
+                    devtools_client,
+                    extension_url,
+                    timeout_seconds=resolve_operation_timeout_seconds(
+                        attempt_started_at,
+                        max_attempt_seconds,
+                        PAGE_READY_TIMEOUT_SECONDS,
+                    ),
+                )
             wait_for_extension_ready(
                 devtools_client,
                 timeout_seconds=resolve_operation_timeout_seconds(
