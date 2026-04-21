@@ -26,14 +26,18 @@ from chrome_runner.constants import (
     ADD_PHONE_ERROR_SIGNAL_TEXTS,
     BASE_PROFILE_DIR_NAME,
     BATCH_PROXY_FAILURE_BLACKLIST_THRESHOLD,
+    DEFAULT_PROFILE_BLACKLIST_TTL_SECONDS,
+    DEFAULT_PROXY_BLACKLIST_SUCCESS_TTL_SECONDS,
+    DEFAULT_PROXY_BLACKLIST_UNSUCCESSFUL_TTL_SECONDS,
     DEFAULT_SMS_CODE_REGEX,
     DEFAULT_SMS_CODE_TIMEOUT_SECONDS,
-    DEFAULT_PROXY_BLACKLIST_TTL_SECONDS,
-    DEFAULT_PROFILE_BLACKLIST_TTL_SECONDS,
     DEFAULT_SMS_SOCKET_HOST,
     EXTENSION_START_MODE_AUTO_RUN,
     EXTENSION_START_MODE_CHOICES,
     PROFILE_BLACKLIST_SIGNAL_TEXTS,
+    PROXY_BLACKLIST_COOLDOWN_KIND_SUCCESS,
+    PROXY_BLACKLIST_COOLDOWN_KIND_UNSUCCESSFUL,
+    PROXY_SUCCESS_FAILURE_THRESHOLD,
     TARGET_EXTENSION_ID,
 )
 from chrome_runner.devtools import close_browser_via_devtools
@@ -53,8 +57,10 @@ from chrome_runner.proxy_blacklist import (
     record_proxy_blacklist_hit,
 )
 from chrome_runner.proxy_stats import (
+    ProxyFailureRecordResult,
     ProxyStatsEntry,
     load_proxy_stats_entries,
+    record_proxy_failure,
     record_proxy_success,
 )
 from chrome_runner.sms_verification import (
@@ -113,6 +119,7 @@ class SingleRunResult:
     selected_proxy_name: str = ""
     selected_proxy_delay_ms: int | None = None
     should_blacklist_selected_proxy: bool = False
+    selected_proxy_failure_recorded: bool = False
 
     @property
     def succeeded(self) -> bool:
@@ -204,13 +211,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--proxy-blacklist-ttl-seconds",
+        "--proxy-blacklist-success-ttl-seconds",
         type=parse_positive_int,
-        default=DEFAULT_PROXY_BLACKLIST_TTL_SECONDS,
+        default=DEFAULT_PROXY_BLACKLIST_SUCCESS_TTL_SECONDS,
         help=(
-            "本地节点黑名单冷却时长。节点命中 add-phone 后，"
-            "达到该秒数前都会被跳过。"
-            f"默认 {DEFAULT_PROXY_BLACKLIST_TTL_SECONDS} 秒。"
+            "成功节点进入本地黑名单后的短冷却时长。"
+            f"默认 {DEFAULT_PROXY_BLACKLIST_SUCCESS_TTL_SECONDS} 秒。"
+        ),
+    )
+    parser.add_argument(
+        "--proxy-blacklist-unsuccessful-ttl-seconds",
+        type=parse_positive_int,
+        default=DEFAULT_PROXY_BLACKLIST_UNSUCCESSFUL_TTL_SECONDS,
+        help=(
+            "未成功节点进入本地黑名单后的长冷却时长。"
+            f"默认 {DEFAULT_PROXY_BLACKLIST_UNSUCCESSFUL_TTL_SECONDS} 秒。"
         ),
     )
     parser.add_argument(
@@ -320,7 +335,13 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="验证码提交按钮 CSS selector。留空时按按钮文案自动查找。",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (
+        args.proxy_blacklist_unsuccessful_ttl_seconds
+        < args.proxy_blacklist_success_ttl_seconds
+    ):
+        parser.error("未成功节点黑名单冷却时长必须大于等于成功节点冷却时长。")
+    return args
 
 
 def resolve_clash_ai_switch_strategy(args: argparse.Namespace) -> str:
@@ -506,6 +527,41 @@ def should_blacklist_profile_for_mailbox_signal(
     )
 
 
+def resolve_proxy_blacklist_cooldown_kind(
+    proxy_stats_entry: ProxyStatsEntry | None,
+) -> str:
+    if proxy_stats_entry is not None and proxy_stats_entry.is_success_proxy:
+        return PROXY_BLACKLIST_COOLDOWN_KIND_SUCCESS
+    return PROXY_BLACKLIST_COOLDOWN_KIND_UNSUCCESSFUL
+
+
+def describe_proxy_blacklist_cooldown_kind(cooldown_kind: str) -> str:
+    if cooldown_kind == PROXY_BLACKLIST_COOLDOWN_KIND_SUCCESS:
+        return "短冷却"
+    return "长冷却"
+
+
+def maybe_record_selected_proxy_failure(
+    base_dir: Path,
+    *,
+    proxy_name: str,
+) -> ProxyFailureRecordResult | None:
+    proxy_name = normalize_proxy_name(proxy_name)
+    if not proxy_name:
+        return None
+    failure_result = record_proxy_failure(base_dir, proxy_name)
+    print(
+        f"自动运行前置：节点 {proxy_name} 连续失败 "
+        f"{failure_result.entry.consecutive_failures} 次。"
+    )
+    if failure_result.did_demote_success_proxy:
+        print(
+            f"自动运行前置：节点 {proxy_name} 连续失败达到 "
+            f"{PROXY_SUCCESS_FAILURE_THRESHOLD} 次，已按未成功节点处理。"
+        )
+    return failure_result
+
+
 def maybe_record_selected_proxy_blacklist(
     base_dir: Path,
     *,
@@ -515,11 +571,22 @@ def maybe_record_selected_proxy_blacklist(
     proxy_name = normalize_proxy_name(proxy_name)
     if not should_blacklist_proxy or not proxy_name:
         return
-    is_new_entry = record_proxy_blacklist_hit(base_dir, proxy_name)
+    cooldown_kind = PROXY_BLACKLIST_COOLDOWN_KIND_UNSUCCESSFUL
+    cooldown_label = describe_proxy_blacklist_cooldown_kind(cooldown_kind)
+    is_new_entry = record_proxy_blacklist_hit(
+        base_dir,
+        proxy_name,
+        cooldown_kind=cooldown_kind,
+    )
     if is_new_entry:
-        print(f"自动运行前置：节点已写入本地黑名单：{proxy_name}")
+        print(
+            f"自动运行前置：节点已写入{cooldown_label}本地黑名单：{proxy_name}"
+        )
         return
-    print(f"自动运行前置：节点再次命中 add-phone，已刷新本地黑名单时间：{proxy_name}")
+    print(
+        f"自动运行前置：节点再次命中 add-phone，"
+        f"已刷新{cooldown_label}本地黑名单时间：{proxy_name}"
+    )
 
 
 def maybe_record_failed_add_phone_email(
@@ -585,7 +652,8 @@ def load_active_proxy_blacklist(
         return frozenset()
     return load_active_proxy_blacklist_names(
         base_dir,
-        args.proxy_blacklist_ttl_seconds,
+        success_ttl_seconds=args.proxy_blacklist_success_ttl_seconds,
+        unsuccessful_ttl_seconds=args.proxy_blacklist_unsuccessful_ttl_seconds,
     )
 
 
@@ -709,10 +777,15 @@ def update_batch_proxy_state(
     result: SingleRunResult,
 ) -> None:
     proxy_name = normalize_proxy_name(result.selected_proxy_name)
-    if result.should_blacklist_selected_proxy or not result.succeeded:
+    if (
+        result.should_blacklist_selected_proxy
+        or result.selected_proxy_failure_recorded
+    ):
         reset_batch_proxy_reuse_state(proxy_state)
         return
     if not proxy_name:
+        if not result.succeeded:
+            reset_batch_proxy_reuse_state(proxy_state)
         return
     if proxy_name == normalize_proxy_name(proxy_state.current_proxy_name):
         proxy_state.current_proxy_run_count += 1
@@ -739,11 +812,16 @@ def maybe_blacklist_batch_failed_proxy(
     proxy_state: BatchProxyState,
     result: SingleRunResult,
 ) -> None:
-    if result.succeeded or result.should_blacklist_selected_proxy:
+    if (
+        result.succeeded
+        or result.should_blacklist_selected_proxy
+        or not result.selected_proxy_failure_recorded
+    ):
         return
     proxy_name = normalize_proxy_name(result.selected_proxy_name)
     if not proxy_name:
         return
+    proxy_stats_entry = load_proxy_stats_entries(base_dir).get(proxy_name)
     failure_count = record_batch_proxy_failure_count(
         proxy_state,
         proxy_name=proxy_name,
@@ -751,17 +829,24 @@ def maybe_blacklist_batch_failed_proxy(
     print(f"自动运行前置：节点 {proxy_name} 本次运行累计失败 {failure_count} 次。")
     if failure_count < BATCH_PROXY_FAILURE_BLACKLIST_THRESHOLD:
         return
-    is_new_entry = record_proxy_blacklist_hit(base_dir, proxy_name)
+    cooldown_kind = resolve_proxy_blacklist_cooldown_kind(proxy_stats_entry)
+    cooldown_label = describe_proxy_blacklist_cooldown_kind(cooldown_kind)
+    is_new_entry = record_proxy_blacklist_hit(
+        base_dir,
+        proxy_name,
+        cooldown_kind=cooldown_kind,
+    )
     if is_new_entry:
         print(
             f"自动运行前置：节点 {proxy_name} 本次运行累计失败达到 "
-            f"{BATCH_PROXY_FAILURE_BLACKLIST_THRESHOLD} 次，已写入本地黑名单。"
+            f"{BATCH_PROXY_FAILURE_BLACKLIST_THRESHOLD} 次，"
+            f"已写入{cooldown_label}本地黑名单。"
         )
     else:
         print(
             f"自动运行前置：节点 {proxy_name} 本次运行累计失败再次达到 "
             f"{BATCH_PROXY_FAILURE_BLACKLIST_THRESHOLD} 次，"
-            "已刷新本地黑名单时间。"
+            f"已刷新{cooldown_label}本地黑名单时间。"
         )
     reset_batch_proxy_reuse_state(proxy_state)
 
@@ -861,6 +946,7 @@ def execute_single_run(
     )
     selected_proxy_delay_ms: int | None = None
     should_blacklist_selected_proxy = False
+    selected_proxy_failure_recorded = False
 
     try:
         if not base_profile_dir.is_dir():
@@ -924,11 +1010,18 @@ def execute_single_run(
                 bool(selected_proxy_name)
                 and hit_add_phone_failure
             )
+            proxy_failure_result: ProxyFailureRecordResult | None = None
             if result.outcome == "success":
                 maybe_record_selected_proxy_success(
                     base_dir,
                     proxy_name=selected_proxy_name,
                 )
+            else:
+                proxy_failure_result = maybe_record_selected_proxy_failure(
+                    base_dir,
+                    proxy_name=selected_proxy_name,
+                )
+                selected_proxy_failure_recorded = proxy_failure_result is not None
             should_blacklist_profile = should_blacklist_profile_for_mailbox_signal(
                 result,
                 uses_blacklistable_mailbox=uses_blacklistable_mailbox,
@@ -985,6 +1078,7 @@ def execute_single_run(
         selected_proxy_name=selected_proxy_name,
         selected_proxy_delay_ms=selected_proxy_delay_ms,
         should_blacklist_selected_proxy=should_blacklist_selected_proxy,
+        selected_proxy_failure_recorded=selected_proxy_failure_recorded,
     )
 
 
@@ -1135,6 +1229,9 @@ def execute_batch_attempt(
                 selected_proxy_delay_ms=single_run_result.selected_proxy_delay_ms,
                 should_blacklist_selected_proxy=(
                     single_run_result.should_blacklist_selected_proxy
+                ),
+                selected_proxy_failure_recorded=(
+                    single_run_result.selected_proxy_failure_recorded
                 ),
             )
     update_batch_proxy_state(proxy_state, single_run_result)

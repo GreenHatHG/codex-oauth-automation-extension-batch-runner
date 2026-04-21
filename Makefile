@@ -11,7 +11,8 @@ TARGET_EXTENSION_ID ?= ckkgfnhgbfmfgpgdiiljgoggimflneii
 # 自动运行公共参数：统一放在顶部，后续调整时只改这一段。
 CLASH_AI_SWITCH_STRATEGY ?= reuse
 CLASH_AI_SWITCH_REUSE_LIMIT ?= 5
-PROXY_BLACKLIST_TTL_SECONDS ?= 86400
+PROXY_BLACKLIST_SUCCESS_TTL_SECONDS ?= 36000
+PROXY_BLACKLIST_UNSUCCESSFUL_TTL_SECONDS ?= 172800
 PROFILE_BLACKLIST_TTL_SECONDS ?= 43200
 MAX_ATTEMPT_SECONDS ?= 1000
 EMAILS_FILE ?= failed_add_phone_emails.txt
@@ -91,7 +92,8 @@ run-2925-batch:
 		--clash-ai-switch-reuse-limit $(CLASH_AI_SWITCH_REUSE_LIMIT) \
 		--extension-id $(TARGET_EXTENSION_ID) \
 		--profile $(BASE_PROFILES_2925) \
-		--proxy-blacklist-ttl-seconds $(PROXY_BLACKLIST_TTL_SECONDS) \
+		--proxy-blacklist-success-ttl-seconds $(PROXY_BLACKLIST_SUCCESS_TTL_SECONDS) \
+		--proxy-blacklist-unsuccessful-ttl-seconds $(PROXY_BLACKLIST_UNSUCCESSFUL_TTL_SECONDS) \
 		--profile-blacklist-ttl-seconds $(PROFILE_BLACKLIST_TTL_SECONDS) \
 		--max-attempt-seconds $(MAX_ATTEMPT_SECONDS)
 
@@ -106,7 +108,8 @@ run-2925-registered-oauth-batch:
 		--clash-ai-switch-reuse-limit $(CLASH_AI_SWITCH_REUSE_LIMIT) \
 		--extension-id $(TARGET_EXTENSION_ID) \
 		--profile $(BASE_PROFILES_2925) \
-		--proxy-blacklist-ttl-seconds $(PROXY_BLACKLIST_TTL_SECONDS) \
+		--proxy-blacklist-success-ttl-seconds $(PROXY_BLACKLIST_SUCCESS_TTL_SECONDS) \
+		--proxy-blacklist-unsuccessful-ttl-seconds $(PROXY_BLACKLIST_UNSUCCESSFUL_TTL_SECONDS) \
 		--profile-blacklist-ttl-seconds $(PROFILE_BLACKLIST_TTL_SECONDS) \
 		--max-attempt-seconds $(MAX_ATTEMPT_SECONDS)
 
@@ -124,7 +127,8 @@ run-qq-sms-batch:
 		--clash-ai-switch-reuse-limit $(CLASH_AI_SWITCH_REUSE_LIMIT) \
 		--extension-id $(TARGET_EXTENSION_ID) \
 		--profile $(QQ_PROFILES) \
-		--proxy-blacklist-ttl-seconds $(PROXY_BLACKLIST_TTL_SECONDS) \
+		--proxy-blacklist-success-ttl-seconds $(PROXY_BLACKLIST_SUCCESS_TTL_SECONDS) \
+		--proxy-blacklist-unsuccessful-ttl-seconds $(PROXY_BLACKLIST_UNSUCCESSFUL_TTL_SECONDS) \
 		--profile-blacklist-ttl-seconds $(PROFILE_BLACKLIST_TTL_SECONDS) \
 		--max-attempt-seconds $(MAX_ATTEMPT_SECONDS) \
 		--no-auto-minimize \

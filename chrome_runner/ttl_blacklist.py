@@ -27,11 +27,16 @@ def _current_time() -> datetime:
     return datetime.now().astimezone().replace(microsecond=0)
 
 
-def _serialize_timestamp(value: datetime) -> str:
+def serialize_blacklist_timestamp(value: datetime) -> str:
     return value.astimezone().replace(microsecond=0).isoformat()
 
 
-def _parse_timestamp(raw_value: object, *, field_name: str, item_name: str) -> datetime:
+def parse_blacklist_timestamp(
+    raw_value: object,
+    *,
+    field_name: str,
+    item_name: str,
+) -> datetime:
     if not isinstance(raw_value, str) or not raw_value.strip():
         raise RuntimeError(f"本地黑名单记录缺少 {field_name}：{item_name}")
     try:
@@ -57,12 +62,12 @@ def _parse_entry(
     normalized_name = normalize_blacklist_name(raw_entry.get(name_field, item_name))
     if not normalized_name:
         raise RuntimeError(f"本地黑名单记录缺少{item_label}名称。")
-    created_at = _parse_timestamp(
+    created_at = parse_blacklist_timestamp(
         raw_entry.get("created_at"),
         field_name="created_at",
         item_name=normalized_name,
     )
-    last_hit_at = _parse_timestamp(
+    last_hit_at = parse_blacklist_timestamp(
         raw_entry.get("last_hit_at"),
         field_name="last_hit_at",
         item_name=normalized_name,
@@ -122,8 +127,8 @@ def save_blacklist_entries(
         BLACKLIST_ROOT_KEY: {
             item_name: {
                 name_field: entry.name,
-                "created_at": _serialize_timestamp(entry.created_at),
-                "last_hit_at": _serialize_timestamp(entry.last_hit_at),
+                "created_at": serialize_blacklist_timestamp(entry.created_at),
+                "last_hit_at": serialize_blacklist_timestamp(entry.last_hit_at),
             }
             for item_name, entry in sorted(entries.items())
         }
