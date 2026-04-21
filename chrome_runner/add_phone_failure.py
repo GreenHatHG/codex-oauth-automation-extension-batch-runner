@@ -13,6 +13,9 @@ CURRENT_EMAIL_PATTERN = re.compile(
     rf"{re.escape(CURRENT_EMAIL_LOG_PREFIX)}\s*"
     rf"({EMAIL_ADDRESS_PATTERN})"
 )
+FAILED_ADD_PHONE_EMAILS_FILE_STEM = Path(FAILED_ADD_PHONE_EMAILS_FILE_NAME).stem
+FAILED_ADD_PHONE_EMAILS_FILE_SUFFIX = Path(FAILED_ADD_PHONE_EMAILS_FILE_NAME).suffix
+EMPTY_PROFILE_NAME_ERROR_MESSAGE = "写入 add-phone 失败邮箱失败：profile 为空。"
 
 
 def extract_latest_current_email(messages: Collection[str]) -> str:
@@ -23,12 +26,26 @@ def extract_latest_current_email(messages: Collection[str]) -> str:
     return latest_email
 
 
-def build_failed_add_phone_emails_file_path(base_dir: Path) -> Path:
-    return base_dir / FAILED_ADD_PHONE_EMAILS_FILE_NAME
+def build_failed_add_phone_emails_file_path(
+    base_dir: Path,
+    profile_name: str,
+) -> Path:
+    normalized_profile_name = profile_name.strip()
+    if not normalized_profile_name:
+        raise RuntimeError(EMPTY_PROFILE_NAME_ERROR_MESSAGE)
+    file_name = (
+        f"{FAILED_ADD_PHONE_EMAILS_FILE_STEM}."
+        f"{normalized_profile_name}"
+        f"{FAILED_ADD_PHONE_EMAILS_FILE_SUFFIX}"
+    )
+    return base_dir / file_name
 
 
-def load_failed_add_phone_emails(base_dir: Path) -> tuple[str, ...]:
-    file_path = build_failed_add_phone_emails_file_path(base_dir)
+def load_failed_add_phone_emails(
+    base_dir: Path,
+    profile_name: str,
+) -> tuple[str, ...]:
+    file_path = build_failed_add_phone_emails_file_path(base_dir, profile_name)
     if not file_path.is_file():
         return ()
 
@@ -43,13 +60,17 @@ def load_failed_add_phone_emails(base_dir: Path) -> tuple[str, ...]:
     return tuple(emails)
 
 
-def record_failed_add_phone_email(base_dir: Path, email: str) -> bool:
+def record_failed_add_phone_email(
+    base_dir: Path,
+    profile_name: str,
+    email: str,
+) -> bool:
     normalized_email = email.strip()
     if not normalized_email:
         raise RuntimeError("写入 add-phone 失败邮箱失败：邮箱为空。")
 
-    file_path = build_failed_add_phone_emails_file_path(base_dir)
-    existing_emails = list(load_failed_add_phone_emails(base_dir))
+    file_path = build_failed_add_phone_emails_file_path(base_dir, profile_name)
+    existing_emails = list(load_failed_add_phone_emails(base_dir, profile_name))
     if normalized_email in existing_emails:
         return False
 

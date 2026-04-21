@@ -592,6 +592,7 @@ def maybe_record_selected_proxy_blacklist(
 def maybe_record_failed_add_phone_email(
     base_dir: Path,
     *,
+    profile_name: str,
     failed_email: str,
     should_record_failed_email: bool,
 ) -> None:
@@ -600,7 +601,11 @@ def maybe_record_failed_add_phone_email(
     if not failed_email:
         print("自动运行前置：命中 add-phone，但没有提取到当前邮箱。")
         return
-    is_new_entry = record_failed_add_phone_email(base_dir, failed_email)
+    is_new_entry = record_failed_add_phone_email(
+        base_dir,
+        profile_name,
+        failed_email,
+    )
     if is_new_entry:
         print(f"自动运行前置：add-phone 失败邮箱已写入文件：{failed_email}")
         return
@@ -1033,6 +1038,7 @@ def execute_single_run(
             )
             maybe_record_failed_add_phone_email(
                 base_dir,
+                profile_name=profile_name,
                 failed_email=result.current_email,
                 should_record_failed_email=hit_add_phone_failure,
             )
