@@ -10,7 +10,12 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from chrome_runner.add_phone_failure import record_failed_add_phone_email
+from chrome_runner.add_phone_failure import (
+    build_failed_add_phone_emails_file_path,
+    load_failed_add_phone_emails,
+    parse_failed_add_phone_profile_name,
+    record_failed_add_phone_email,
+)
 from chrome_runner.chrome import (
     build_command,
     build_runtime_profile_dir,
@@ -34,6 +39,7 @@ from chrome_runner.constants import (
     DEFAULT_SMS_SOCKET_HOST,
     EXTENSION_START_MODE_AUTO_RUN,
     EXTENSION_START_MODE_CHOICES,
+    EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY,
     PROFILE_BLACKLIST_SIGNAL_TEXTS,
     PROXY_BLACKLIST_COOLDOWN_KIND_SUCCESS,
     PROXY_BLACKLIST_COOLDOWN_KIND_UNSUCCESSFUL,
@@ -94,6 +100,7 @@ INTERRUPTED_EXIT_CODE = 130
 INTERRUPTED_MESSAGE = "已中断当前运行。"
 INIT_PROFILE_SCRIPT_NAME = "init_chrome_profile.py"
 MISSING_PROFILE_MESSAGE = "缺少基准 profile 目录"
+FAILED_EMAIL_RECORD_OUTCOMES = frozenset({"failure", "timeout", "attempt_timeout"})
 
 
 @dataclass(frozen=True)
@@ -104,6 +111,8 @@ class RunAttemptResult:
     exit_code: int
     duration_seconds: float
     summary_text: str
+    profile_name: str = ""
+    start_mode: str = EXTENSION_START_MODE_AUTO_RUN
 
     @property
     def succeeded(self) -> bool:
@@ -140,6 +149,17 @@ class BatchProfileState:
     """Batch-level profile selection state."""
 
     next_profile_index: int = 0
+
+
+@dataclass(frozen=True)
+class BatchAttemptRequest:
+    """Single batch attempt plan."""
+
+    start_mode: str
+    registration_email: str = ""
+    forced_profile_name: str = ""
+    emails_file_path: Path | None = None
+    pending_registration_emails: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -409,6 +429,23 @@ def build_emails_file_path(args: argparse.Namespace) -> Path | None:
     return Path(emails_file).expanduser()
 
 
+def resolve_emails_file_profile_names(
+    args: argparse.Namespace,
+    profile_names: Sequence[str],
+) -> tuple[str, ...]:
+    emails_file_path = build_emails_file_path(args)
+    if emails_file_path is None:
+        return tuple(profile_names)
+    parsed_profile_name = parse_failed_add_phone_profile_name(emails_file_path)
+    if parsed_profile_name is None:
+        return tuple(profile_names)
+    print(
+        "邮箱文件模式：从失败邮箱文件名解析出 profile："
+        f"{parsed_profile_name}"
+    )
+    return (parsed_profile_name,)
+
+
 def remove_email_from_pending_list(
     pending_emails: list[str],
     registration_email: str,
@@ -424,11 +461,12 @@ def remove_email_from_pending_list(
 
 
 def persist_successful_email_removal(
-    args: argparse.Namespace,
+    emails_file_path: Path | None,
     pending_emails: list[str],
     registration_email: str,
+    *,
+    file_label: str,
 ) -> list[str]:
-    emails_file_path = build_emails_file_path(args)
     if emails_file_path is None:
         return pending_emails
     next_pending_emails = remove_email_from_pending_list(
@@ -437,7 +475,7 @@ def persist_successful_email_removal(
     )
     save_email_lines(emails_file_path, next_pending_emails)
     print(
-        f"邮箱文件已移除成功邮箱：{registration_email}；"
+        f"{file_label}已移除成功邮箱：{registration_email}；"
         f"剩余 {len(next_pending_emails)} 个邮箱。"
     )
     return next_pending_emails
@@ -511,6 +549,13 @@ def did_hit_add_phone_failure(result: ExtensionRunResult) -> bool:
     return has_any_signal_text(
         build_extension_result_messages(result),
         ADD_PHONE_ERROR_SIGNAL_TEXTS,
+    )
+
+
+def should_record_failed_email_for_result(result: ExtensionRunResult) -> bool:
+    return (
+        result.outcome in FAILED_EMAIL_RECORD_OUTCOMES
+        and result.saw_current_email_log
     )
 
 
@@ -599,7 +644,7 @@ def maybe_record_failed_add_phone_email(
     if not should_record_failed_email:
         return
     if not failed_email:
-        print("自动运行前置：命中 add-phone，但没有提取到当前邮箱。")
+        print("自动运行前置：本轮未成功，但日志里没有提取到当前邮箱。")
         return
     is_new_entry = record_failed_add_phone_email(
         base_dir,
@@ -607,9 +652,9 @@ def maybe_record_failed_add_phone_email(
         failed_email,
     )
     if is_new_entry:
-        print(f"自动运行前置：add-phone 失败邮箱已写入文件：{failed_email}")
+        print(f"自动运行前置：未成功邮箱已写入文件：{failed_email}")
         return
-    print(f"自动运行前置：add-phone 失败邮箱已存在，跳过重复写入：{failed_email}")
+    print(f"自动运行前置：未成功邮箱已存在，跳过重复写入：{failed_email}")
 
 
 def maybe_record_profile_blacklist(
@@ -739,6 +784,24 @@ def choose_next_profile_name(
     raise RuntimeError(
         f"所有 profile 都处于本地黑名单冷却期：{blacklisted_profile_names_text}"
     )
+
+
+def choose_batch_profile_name(
+    profile_names: Sequence[str],
+    active_profile_blacklist: Collection[str],
+    profile_state: BatchProfileState,
+    *,
+    forced_profile_name: str = "",
+) -> str:
+    if not forced_profile_name:
+        return choose_next_profile_name(
+            profile_names,
+            active_profile_blacklist,
+            profile_state,
+        )
+    if forced_profile_name in active_profile_blacklist:
+        raise RuntimeError(f"profile {forced_profile_name} 处于本地黑名单冷却期。")
+    return forced_profile_name
 
 
 def should_switch_proxy_for_batch_attempt(
@@ -926,6 +989,7 @@ def execute_single_run(
     base_dir: Path,
     base_profile_dir: Path,
     *,
+    start_mode: str | None = None,
     registration_email: str = "",
     excluded_proxy_names: frozenset[str] = frozenset(),
     proxy_stats_entries: dict[str, ProxyStatsEntry] | None = None,
@@ -941,6 +1005,7 @@ def execute_single_run(
     summary_text = ""
     cleanup_error: Exception | None = None
     profile_name = base_profile_dir.name
+    resolved_start_mode = start_mode or args.extension_start_mode
     uses_blacklistable_mailbox = profile_uses_blacklistable_mailbox(base_profile_dir)
     if should_switch_proxy is None:
         should_switch_proxy = should_enable_clash_ai_switch(args)
@@ -1000,7 +1065,7 @@ def execute_single_run(
                 remote_debugging_port,
                 args.extension_id,
                 auto_minimize=should_auto_minimize(args),
-                start_mode=args.extension_start_mode,
+                start_mode=resolved_start_mode,
                 max_attempt_seconds=args.max_attempt_seconds,
                 registration_email=registration_email,
                 snapshot_observer=(
@@ -1040,7 +1105,9 @@ def execute_single_run(
                 base_dir,
                 profile_name=profile_name,
                 failed_email=result.current_email,
-                should_record_failed_email=hit_add_phone_failure,
+                should_record_failed_email=should_record_failed_email_for_result(
+                    result
+                ),
             )
             maybe_record_profile_blacklist(
                 base_dir,
@@ -1151,6 +1218,16 @@ def print_batch_summary(
     total_duration_seconds: float,
 ) -> None:
     total_runs = len(results)
+    auto_run_count = sum(
+        1
+        for result in results
+        if result.start_mode == EXTENSION_START_MODE_AUTO_RUN
+    )
+    retry_run_count = sum(
+        1
+        for result in results
+        if result.start_mode == EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY
+    )
     success_count = sum(1 for result in results if result.succeeded)
     failure_results = [result for result in results if not result.succeeded]
     failure_count = len(failure_results)
@@ -1159,6 +1236,8 @@ def print_batch_summary(
 
     print("批量运行汇总：")
     print(f"总轮数: {total_runs}")
+    print(f"新号轮次: {auto_run_count}")
+    print(f"失败邮箱重跑轮次: {retry_run_count}")
     print(f"成功次数: {success_count}")
     print(f"失败次数: {failure_count}")
     print(f"成功率: {success_rate:.1f}%")
@@ -1169,30 +1248,80 @@ def print_batch_summary(
         print(f"失败轮次 {result.index}: {result.summary_text}")
 
 
+def build_auto_run_attempt_request() -> BatchAttemptRequest:
+    return BatchAttemptRequest(start_mode=EXTENSION_START_MODE_AUTO_RUN)
+
+
+def build_emails_file_attempt_request(
+    args: argparse.Namespace,
+    registration_email: str,
+    pending_registration_emails: list[str],
+) -> BatchAttemptRequest:
+    return BatchAttemptRequest(
+        start_mode=args.extension_start_mode,
+        registration_email=registration_email,
+        emails_file_path=build_emails_file_path(args),
+        pending_registration_emails=tuple(pending_registration_emails),
+    )
+
+
+def should_attempt_failed_email_retry(
+    args: argparse.Namespace,
+    proxy_state: BatchProxyState,
+    previous_result: RunAttemptResult | None,
+) -> bool:
+    if previous_result is None or not previous_result.succeeded:
+        return False
+    if not previous_result.profile_name:
+        return False
+    if resolve_clash_ai_switch_strategy(args) != CLASH_AI_SWITCH_STRATEGY_REUSE:
+        return False
+    return not should_switch_proxy_for_batch_attempt(args, proxy_state)
+
+
+def build_failed_email_retry_request(
+    base_dir: Path,
+    *,
+    profile_name: str,
+) -> BatchAttemptRequest | None:
+    pending_emails = load_failed_add_phone_emails(base_dir, profile_name)
+    if not pending_emails:
+        return None
+    return BatchAttemptRequest(
+        start_mode=EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY,
+        registration_email=pending_emails[0],
+        forced_profile_name=profile_name,
+        emails_file_path=build_failed_add_phone_emails_file_path(base_dir, profile_name),
+        pending_registration_emails=pending_emails,
+    )
+
+
 def execute_batch_attempt(
     args: argparse.Namespace,
     base_dir: Path,
     profile_names: Sequence[str],
     *,
+    attempt_request: BatchAttemptRequest,
     attempt_index: int,
     total_runs: int | None,
-    registration_email: str,
-    pending_registration_emails: list[str],
     proxy_state: BatchProxyState,
     profile_state: BatchProfileState,
 ) -> tuple[RunAttemptResult, list[str]]:
     active_profile_blacklist = load_active_profile_blacklist(args, base_dir)
     report_skipped_blacklisted_profiles(profile_names, active_profile_blacklist)
-    profile_name = choose_next_profile_name(
+    profile_name = choose_batch_profile_name(
         profile_names,
         active_profile_blacklist,
         profile_state,
+        forced_profile_name=attempt_request.forced_profile_name,
     )
     base_profile_dir = build_base_profile_dir(base_dir, profile_name)
     print(f"第 {attempt_index} 轮开始")
     print(f"本轮基准 profile: {profile_name}")
-    if registration_email:
-        print(f"本轮指定邮箱: {registration_email}")
+    if attempt_request.start_mode != EXTENSION_START_MODE_AUTO_RUN:
+        print(f"本轮启动模式: {attempt_request.start_mode}")
+    if attempt_request.registration_email:
+        print(f"本轮指定邮箱: {attempt_request.registration_email}")
     attempt_started_at = time.perf_counter()
     proxy_selection_state = load_proxy_selection_state(args, base_dir)
     maybe_reset_reused_proxy_for_blacklist(
@@ -1206,7 +1335,8 @@ def execute_batch_attempt(
         args,
         base_dir,
         base_profile_dir,
-        registration_email=registration_email,
+        start_mode=attempt_request.start_mode,
+        registration_email=attempt_request.registration_email,
         excluded_proxy_names=proxy_selection_state.blacklisted_proxy_names,
         proxy_stats_entries=proxy_selection_state.stats_entries,
         current_proxy_name=proxy_state.current_proxy_name,
@@ -1217,12 +1347,26 @@ def execute_batch_attempt(
         proxy_state,
         single_run_result,
     )
-    if registration_email and single_run_result.succeeded:
+    pending_registration_emails = list(attempt_request.pending_registration_emails)
+    if (
+        attempt_request.registration_email
+        and single_run_result.succeeded
+        and attempt_request.emails_file_path is not None
+    ):
         try:
+            file_label = (
+                "失败邮箱文件"
+                if (
+                    attempt_request.start_mode
+                    == EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY
+                )
+                else "邮箱文件"
+            )
             pending_registration_emails = persist_successful_email_removal(
-                args,
+                attempt_request.emails_file_path,
                 pending_registration_emails,
-                registration_email,
+                attempt_request.registration_email,
+                file_label=file_label,
             )
         except Exception as exc:  # noqa: BLE001
             single_run_result = SingleRunResult(
@@ -1247,6 +1391,8 @@ def execute_batch_attempt(
         exit_code=single_run_result.exit_code,
         duration_seconds=duration_seconds,
         summary_text=single_run_result.summary_text,
+        profile_name=profile_name,
+        start_mode=attempt_request.start_mode,
     )
     print_attempt_result(result, total_runs)
     return result, pending_registration_emails
@@ -1289,10 +1435,13 @@ def run_batch(
                     args,
                     base_dir,
                     profile_names,
+                    attempt_request=build_emails_file_attempt_request(
+                        args,
+                        registration_email,
+                        pending_registration_emails,
+                    ),
                     attempt_index=attempt_index,
                     total_runs=None,
-                    registration_email=registration_email,
-                    pending_registration_emails=pending_registration_emails,
                     proxy_state=proxy_state,
                     profile_state=profile_state,
                 )
@@ -1308,21 +1457,67 @@ def run_batch(
             )
     else:
         total_runs = resolve_total_runs(args, batch_registration_emails)
-        registration_emails = tuple("" for _ in range(total_runs))
-        pending_registration_emails = list(registration_emails)
-        for attempt_index, registration_email in enumerate(registration_emails, start=1):
-            result, pending_registration_emails = execute_batch_attempt(
-                args,
-                base_dir,
-                profile_names,
-                attempt_index=attempt_index,
-                total_runs=total_runs,
-                registration_email=registration_email,
-                pending_registration_emails=pending_registration_emails,
-                proxy_state=proxy_state,
-                profile_state=profile_state,
-            )
-            results.append(result)
+        if args.extension_start_mode != EXTENSION_START_MODE_AUTO_RUN:
+            for attempt_index in range(1, total_runs + 1):
+                result, _ = execute_batch_attempt(
+                    args,
+                    base_dir,
+                    profile_names,
+                    attempt_request=BatchAttemptRequest(
+                        start_mode=args.extension_start_mode,
+                    ),
+                    attempt_index=attempt_index,
+                    total_runs=total_runs,
+                    proxy_state=proxy_state,
+                    profile_state=profile_state,
+                )
+                results.append(result)
+        else:
+            remaining_auto_runs = total_runs
+            attempt_index = 0
+            previous_result: RunAttemptResult | None = None
+            while True:
+                attempt_request = None
+                if should_attempt_failed_email_retry(
+                    args,
+                    proxy_state,
+                    previous_result,
+                ):
+                    attempt_request = build_failed_email_retry_request(
+                        base_dir,
+                        profile_name=previous_result.profile_name,
+                    )
+                    if attempt_request is not None:
+                        print(
+                            "失败邮箱重跑：继续复用当前节点，处理 "
+                            f"profile {attempt_request.forced_profile_name} 的邮箱 "
+                            f"{attempt_request.registration_email}。"
+                        )
+                if attempt_request is None:
+                    if remaining_auto_runs <= 0:
+                        break
+                    if (
+                        previous_result is not None
+                        and previous_result.start_mode
+                        == EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY
+                        and not previous_result.succeeded
+                    ):
+                        print("失败邮箱重跑失败，切回新号模式。")
+                    remaining_auto_runs -= 1
+                    attempt_request = build_auto_run_attempt_request()
+                attempt_index += 1
+                result, _ = execute_batch_attempt(
+                    args,
+                    base_dir,
+                    profile_names,
+                    attempt_request=attempt_request,
+                    attempt_index=attempt_index,
+                    total_runs=None,
+                    proxy_state=proxy_state,
+                    profile_state=profile_state,
+                )
+                results.append(result)
+                previous_result = result
 
     total_duration_seconds = time.perf_counter() - batch_started_at
     print_batch_summary(results, total_duration_seconds=total_duration_seconds)
@@ -1336,6 +1531,8 @@ def main() -> int:
 
     try:
         batch_registration_emails = load_batch_registration_emails(args)
+        if batch_registration_emails:
+            profile_names = resolve_emails_file_profile_names(args, profile_names)
         validate_batch_args(
             args,
             base_dir,

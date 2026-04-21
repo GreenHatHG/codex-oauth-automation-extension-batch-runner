@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
 import re
 from collections.abc import Collection
 from pathlib import Path
 
 from .constants import CURRENT_EMAIL_LOG_PREFIX, FAILED_ADD_PHONE_EMAILS_FILE_NAME
 from .email_utils import EMAIL_ADDRESS_PATTERN
+from .profile import parse_profile_name
 
 CURRENT_EMAIL_PATTERN = re.compile(
     rf"{re.escape(CURRENT_EMAIL_LOG_PREFIX)}\s*"
@@ -15,6 +17,7 @@ CURRENT_EMAIL_PATTERN = re.compile(
 )
 FAILED_ADD_PHONE_EMAILS_FILE_STEM = Path(FAILED_ADD_PHONE_EMAILS_FILE_NAME).stem
 FAILED_ADD_PHONE_EMAILS_FILE_SUFFIX = Path(FAILED_ADD_PHONE_EMAILS_FILE_NAME).suffix
+FAILED_ADD_PHONE_EMAILS_FILE_PREFIX = f"{FAILED_ADD_PHONE_EMAILS_FILE_STEM}."
 EMPTY_PROFILE_NAME_ERROR_MESSAGE = "写入 add-phone 失败邮箱失败：profile 为空。"
 
 
@@ -39,6 +42,23 @@ def build_failed_add_phone_emails_file_path(
         f"{FAILED_ADD_PHONE_EMAILS_FILE_SUFFIX}"
     )
     return base_dir / file_name
+
+
+def parse_failed_add_phone_profile_name(file_path: Path) -> str | None:
+    file_name = file_path.name.strip()
+    if not file_name.startswith(FAILED_ADD_PHONE_EMAILS_FILE_PREFIX):
+        return None
+    if not file_name.endswith(FAILED_ADD_PHONE_EMAILS_FILE_SUFFIX):
+        return None
+    raw_profile_name = file_name[
+        len(FAILED_ADD_PHONE_EMAILS_FILE_PREFIX) : -len(FAILED_ADD_PHONE_EMAILS_FILE_SUFFIX)
+    ]
+    if not raw_profile_name:
+        return None
+    try:
+        return parse_profile_name(raw_profile_name)
+    except argparse.ArgumentTypeError:
+        return None
 
 
 def load_failed_add_phone_emails(

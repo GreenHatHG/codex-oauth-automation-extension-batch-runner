@@ -84,6 +84,7 @@ class ExtensionRunResult:
     timeout_seconds: float = 0.0
     recent_logs: tuple[str, ...] = ()
     current_email: str = ""
+    saw_current_email_log: bool = False
 
 
 SnapshotObserver = Callable[[ExtensionSnapshot, float | None], None]
@@ -97,14 +98,22 @@ def build_snapshot_messages(snapshot: ExtensionSnapshot) -> tuple[str, ...]:
     return (snapshot.status_text, *snapshot.recent_logs)
 
 
+def extract_snapshot_current_email(snapshot: ExtensionSnapshot) -> str:
+    return extract_latest_current_email(build_snapshot_messages(snapshot))
+
+
 def resolve_snapshot_current_email(
     snapshot: ExtensionSnapshot,
     previous_current_email: str = "",
 ) -> str:
-    current_email = extract_latest_current_email(build_snapshot_messages(snapshot))
+    current_email = extract_snapshot_current_email(snapshot)
     if current_email:
         return current_email
     return previous_current_email
+
+
+def did_snapshot_log_current_email(snapshot: ExtensionSnapshot) -> bool:
+    return bool(extract_snapshot_current_email(snapshot))
 
 
 def wait_for_extension_ready(
@@ -348,12 +357,14 @@ def classify_extension_snapshot(
     *,
     stagnant_seconds: float,
     current_email: str = "",
+    saw_current_email_log: bool = False,
 ) -> ExtensionRunResult | None:
     if any(text in snapshot.status_text for text in SUCCESS_STATUS_TEXTS):
         return ExtensionRunResult(
             "success",
             snapshot.status_text,
             current_email=current_email,
+            saw_current_email_log=saw_current_email_log,
         )
     if any(text in snapshot.status_text for text in FAILURE_STATUS_TEXTS):
         return ExtensionRunResult(
@@ -361,6 +372,7 @@ def classify_extension_snapshot(
             snapshot.status_text,
             recent_logs=snapshot.recent_logs,
             current_email=current_email,
+            saw_current_email_log=saw_current_email_log,
         )
     if stagnant_seconds >= RUN_MONITOR_STAGNATION_TIMEOUT_SECONDS:
         status_text = snapshot.status_text or "状态长期无变化"
@@ -370,6 +382,7 @@ def classify_extension_snapshot(
             timeout_seconds=stagnant_seconds,
             recent_logs=snapshot.recent_logs,
             current_email=current_email,
+            saw_current_email_log=saw_current_email_log,
         )
     return None
 
@@ -389,6 +402,7 @@ def build_attempt_timeout_result(
     timeout_seconds: int,
     recent_logs: tuple[str, ...] = (),
     current_email: str = "",
+    saw_current_email_log: bool = False,
 ) -> ExtensionRunResult:
     return ExtensionRunResult(
         "attempt_timeout",
@@ -396,6 +410,7 @@ def build_attempt_timeout_result(
         timeout_seconds=timeout_seconds,
         recent_logs=recent_logs,
         current_email=current_email,
+        saw_current_email_log=saw_current_email_log,
     )
 
 
@@ -438,70 +453,87 @@ def monitor_extension_run(
         snapshot,
         previous_current_email=initial_email,
     )
-    if snapshot_observer is not None:
-        snapshot_observer(
-            snapshot,
-            compute_remaining_attempt_seconds(
-                attempt_started_at,
-                max_attempt_seconds,
-            ),
-        )
+    saw_current_email_log = did_snapshot_log_current_email(snapshot)
+    try:
+        if snapshot_observer is not None:
+            snapshot_observer(
+                snapshot,
+                compute_remaining_attempt_seconds(
+                    attempt_started_at,
+                    max_attempt_seconds,
+                ),
+            )
 
-    if snapshot.status_text:
-        print(f"扩展状态：{snapshot.status_text}")
-        last_reported_status = snapshot.status_text
+        if snapshot.status_text:
+            print(f"扩展状态：{snapshot.status_text}")
+            last_reported_status = snapshot.status_text
 
-    while True:
-        now = time.time()
-        stagnant_seconds = now - last_change_at
-        outcome = classify_extension_snapshot(
-            last_snapshot,
-            stagnant_seconds=stagnant_seconds,
-            current_email=current_email,
-        )
-        if outcome is not None:
-            return outcome
+        while True:
+            now = time.time()
+            stagnant_seconds = now - last_change_at
+            outcome = classify_extension_snapshot(
+                last_snapshot,
+                stagnant_seconds=stagnant_seconds,
+                current_email=current_email,
+                saw_current_email_log=saw_current_email_log,
+            )
+            if outcome is not None:
+                return outcome
+            if has_attempt_timed_out(attempt_started_at, max_attempt_seconds):
+                return build_attempt_timeout_result(
+                    last_snapshot.status_text or "状态未知",
+                    timeout_seconds=max_attempt_seconds or 0,
+                    recent_logs=last_snapshot.recent_logs,
+                    current_email=current_email,
+                    saw_current_email_log=saw_current_email_log,
+                )
+            sleep_seconds = RUN_MONITOR_POLL_INTERVAL_SECONDS
+            if max_attempt_seconds is not None:
+                remaining_seconds = max_attempt_seconds - (
+                    time.monotonic() - attempt_started_at
+                )
+                if remaining_seconds <= 0:
+                    return build_attempt_timeout_result(
+                        last_snapshot.status_text or "状态未知",
+                        timeout_seconds=max_attempt_seconds,
+                        recent_logs=last_snapshot.recent_logs,
+                        current_email=current_email,
+                        saw_current_email_log=saw_current_email_log,
+                    )
+                sleep_seconds = min(sleep_seconds, remaining_seconds)
+            time.sleep(sleep_seconds)
+            snapshot = capture_extension_snapshot(devtools_client)
+            if snapshot.fingerprint != last_snapshot.fingerprint:
+                last_snapshot = snapshot
+                last_change_at = time.time()
+                current_email = resolve_snapshot_current_email(
+                    snapshot,
+                    previous_current_email=current_email,
+                )
+                saw_current_email_log = (
+                    saw_current_email_log or did_snapshot_log_current_email(snapshot)
+                )
+                if snapshot_observer is not None:
+                    snapshot_observer(
+                        snapshot,
+                        compute_remaining_attempt_seconds(
+                            attempt_started_at,
+                            max_attempt_seconds,
+                        ),
+                    )
+                if snapshot.status_text and snapshot.status_text != last_reported_status:
+                    print(f"扩展状态：{snapshot.status_text}")
+                    last_reported_status = snapshot.status_text
+    except TimeoutError as exc:
         if has_attempt_timed_out(attempt_started_at, max_attempt_seconds):
             return build_attempt_timeout_result(
-                last_snapshot.status_text or "状态未知",
+                str(exc),
                 timeout_seconds=max_attempt_seconds or 0,
                 recent_logs=last_snapshot.recent_logs,
                 current_email=current_email,
+                saw_current_email_log=saw_current_email_log,
             )
-
-        sleep_seconds = RUN_MONITOR_POLL_INTERVAL_SECONDS
-        if max_attempt_seconds is not None:
-            remaining_seconds = max_attempt_seconds - (
-                time.monotonic() - attempt_started_at
-            )
-            if remaining_seconds <= 0:
-                return build_attempt_timeout_result(
-                    last_snapshot.status_text or "状态未知",
-                    timeout_seconds=max_attempt_seconds,
-                    recent_logs=last_snapshot.recent_logs,
-                    current_email=current_email,
-                )
-            sleep_seconds = min(sleep_seconds, remaining_seconds)
-        time.sleep(sleep_seconds)
-        snapshot = capture_extension_snapshot(devtools_client)
-        if snapshot.fingerprint != last_snapshot.fingerprint:
-            last_snapshot = snapshot
-            last_change_at = time.time()
-            current_email = resolve_snapshot_current_email(
-                snapshot,
-                previous_current_email=current_email,
-            )
-            if snapshot_observer is not None:
-                snapshot_observer(
-                    snapshot,
-                    compute_remaining_attempt_seconds(
-                        attempt_started_at,
-                        max_attempt_seconds,
-                    ),
-                )
-            if snapshot.status_text and snapshot.status_text != last_reported_status:
-                print(f"扩展状态：{snapshot.status_text}")
-                last_reported_status = snapshot.status_text
+        raise
 
 
 def create_extension_target(
