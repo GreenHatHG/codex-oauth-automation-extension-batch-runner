@@ -14,7 +14,9 @@ from chrome_runner.add_phone_failure import (
     build_failed_add_phone_emails_file_path,
     load_failed_add_phone_emails,
     parse_failed_add_phone_profile_name,
+    record_failed_add_phone_email_retry,
     record_failed_add_phone_email,
+    remove_failed_add_phone_email,
 )
 from chrome_runner.chrome import (
     build_command,
@@ -31,6 +33,7 @@ from chrome_runner.constants import (
     ADD_PHONE_ERROR_SIGNAL_TEXTS,
     BASE_PROFILE_DIR_NAME,
     BATCH_PROXY_FAILURE_BLACKLIST_THRESHOLD,
+    DEFAULT_FAILED_ADD_PHONE_EMAIL_MAX_RETRIES,
     DEFAULT_PROFILE_BLACKLIST_TTL_SECONDS,
     DEFAULT_PROXY_BLACKLIST_SUCCESS_TTL_SECONDS,
     DEFAULT_PROXY_BLACKLIST_UNSUCCESSFUL_TTL_SECONDS,
@@ -318,6 +321,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "邮箱文件模式下，首轮结束后额外继续跑剩余邮箱的轮数。"
             f"默认 {DEFAULT_EMAILS_FILE_EXTRA_ROUNDS}。"
+        ),
+    )
+    parser.add_argument(
+        "--failed-add-phone-email-max-retries",
+        type=parse_positive_int,
+        default=DEFAULT_FAILED_ADD_PHONE_EMAIL_MAX_RETRIES,
+        help=(
+            "失败邮箱重跑模式下，单个邮箱连续失败达到该次数后"
+            "会从失败邮箱文件移除。"
+            f"默认 {DEFAULT_FAILED_ADD_PHONE_EMAIL_MAX_RETRIES}。"
         ),
     )
     parser.add_argument(
@@ -1296,6 +1309,13 @@ def build_failed_email_retry_request(
     )
 
 
+def is_failed_add_phone_retry_attempt(attempt_request: BatchAttemptRequest) -> bool:
+    return bool(
+        attempt_request.start_mode == EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY
+        and attempt_request.forced_profile_name
+    )
+
+
 def execute_batch_attempt(
     args: argparse.Namespace,
     base_dir: Path,
@@ -1354,25 +1374,77 @@ def execute_batch_attempt(
         and attempt_request.emails_file_path is not None
     ):
         try:
-            file_label = (
-                "失败邮箱文件"
-                if (
-                    attempt_request.start_mode
-                    == EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY
+            if is_failed_add_phone_retry_attempt(attempt_request):
+                pending_registration_emails = list(
+                    remove_failed_add_phone_email(
+                        base_dir,
+                        attempt_request.forced_profile_name,
+                        attempt_request.registration_email,
+                    )
                 )
-                else "邮箱文件"
-            )
-            pending_registration_emails = persist_successful_email_removal(
-                attempt_request.emails_file_path,
-                pending_registration_emails,
-                attempt_request.registration_email,
-                file_label=file_label,
-            )
+                print(
+                    f"失败邮箱文件已移除成功邮箱：{attempt_request.registration_email}；"
+                    f"剩余 {len(pending_registration_emails)} 个邮箱。"
+                )
+            else:
+                pending_registration_emails = persist_successful_email_removal(
+                    attempt_request.emails_file_path,
+                    pending_registration_emails,
+                    attempt_request.registration_email,
+                    file_label="邮箱文件",
+                )
         except Exception as exc:  # noqa: BLE001
             single_run_result = SingleRunResult(
                 exit_code=1,
                 summary_text=(
                     "启动失败: 成功邮箱写回邮箱文件失败："
+                    f"{exc}"
+                ),
+                selected_proxy_name=single_run_result.selected_proxy_name,
+                selected_proxy_delay_ms=single_run_result.selected_proxy_delay_ms,
+                should_blacklist_selected_proxy=(
+                    single_run_result.should_blacklist_selected_proxy
+                ),
+                selected_proxy_failure_recorded=(
+                    single_run_result.selected_proxy_failure_recorded
+                ),
+            )
+    elif (
+        attempt_request.registration_email
+        and not single_run_result.succeeded
+        and is_failed_add_phone_retry_attempt(attempt_request)
+    ):
+        try:
+            retry_result = record_failed_add_phone_email_retry(
+                base_dir,
+                attempt_request.forced_profile_name,
+                attempt_request.registration_email,
+                max_retry_count=args.failed_add_phone_email_max_retries,
+            )
+            if retry_result.did_remove_email:
+                print(
+                    "失败邮箱重跑：邮箱 "
+                    f"{attempt_request.registration_email} 已连续失败 "
+                    f"{retry_result.retry_count} 次，已从失败邮箱文件移除；"
+                    f"剩余 {retry_result.remaining_email_count} 个邮箱。"
+                )
+                pending_registration_emails = remove_email_from_pending_list(
+                    pending_registration_emails,
+                    attempt_request.registration_email,
+                )
+            else:
+                print(
+                    "失败邮箱重跑：邮箱 "
+                    f"{attempt_request.registration_email} 已连续失败 "
+                    f"{retry_result.retry_count}/"
+                    f"{args.failed_add_phone_email_max_retries} 次，"
+                    "保留在失败邮箱文件中。"
+                )
+        except Exception as exc:  # noqa: BLE001
+            single_run_result = SingleRunResult(
+                exit_code=1,
+                summary_text=(
+                    "启动失败: 更新失败邮箱重试次数失败："
                     f"{exc}"
                 ),
                 selected_proxy_name=single_run_result.selected_proxy_name,
