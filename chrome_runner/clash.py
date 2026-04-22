@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 import socket
 import time
 import urllib.error
@@ -185,7 +186,23 @@ def build_available_proxy_candidates(
     available_candidates.sort(
         key=lambda proxy_name: build_proxy_priority_sort_key(proxy_name, stats_entries)
     )
-    return available_candidates
+    first_unsuccessful_index = len(available_candidates)
+    for index, proxy_name in enumerate(available_candidates):
+        entry = stats_entries.get(normalize_proxy_name(proxy_name))
+        if entry is not None and entry.is_success_proxy:
+            continue
+        first_unsuccessful_index = index
+        break
+
+    if first_unsuccessful_index >= len(available_candidates) - 1:
+        return available_candidates
+
+    unsuccessful_candidates = available_candidates[first_unsuccessful_index:]
+    random.shuffle(unsuccessful_candidates)
+    return (
+        available_candidates[:first_unsuccessful_index]
+        + unsuccessful_candidates
+    )
 
 
 def probe_clash_proxy_delay(proxy_name: str) -> int | None:
