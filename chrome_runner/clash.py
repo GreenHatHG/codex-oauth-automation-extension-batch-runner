@@ -53,6 +53,10 @@ def build_clash_selector_url() -> str:
     return f"{CLASH_BASE_URL}/proxies/{urllib.parse.quote(CLASH_GROUP_NAME, safe='')}"
 
 
+def build_clash_connections_url() -> str:
+    return f"{CLASH_BASE_URL}/connections"
+
+
 def should_retry_clash_error(exc: urllib.error.URLError) -> bool:
     reason = exc.reason
     if isinstance(reason, (socket.timeout, TimeoutError, ConnectionResetError)):
@@ -232,6 +236,14 @@ def switch_clash_proxy(proxy_name: str) -> None:
     )
 
 
+def clear_clash_connections() -> None:
+    request_json(
+        build_clash_connections_url(),
+        error_message="清除 Clash 旧连接失败",
+        method="DELETE",
+    )
+
+
 def run_pre_run_clash_ai_switch(
     *,
     excluded_proxy_names: Collection[str] = (),
@@ -280,9 +292,10 @@ def run_pre_run_clash_ai_switch(
                 continue
 
             switch_clash_proxy(proxy_name)
+            clear_clash_connections()
             print(
                 f"自动运行前置：已由 {current_proxy_name or '未知'} 切到 "
-                f"{proxy_name}，延迟 {delay} ms。"
+                f"{proxy_name}，延迟 {delay} ms，并已清除旧连接。"
             )
             return {
                 "proxy_name": proxy_name,
