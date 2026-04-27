@@ -6,3 +6,4 @@ __pycache__/
 .proxy-stats.json
 failed_add_phone_emails*.txt
 failed_add_phone_email_retry_counts*.json
+failed_signup_emails*.txt

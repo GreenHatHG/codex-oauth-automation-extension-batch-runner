@@ -85,6 +85,7 @@ class ExtensionRunResult:
     recent_logs: tuple[str, ...] = ()
     current_email: str = ""
     saw_current_email_log: bool = False
+    step_signature: tuple[str, ...] = ()
 
 
 SnapshotObserver = Callable[[ExtensionSnapshot, float | None], None]
@@ -365,6 +366,7 @@ def classify_extension_snapshot(
             snapshot.status_text,
             current_email=current_email,
             saw_current_email_log=saw_current_email_log,
+            step_signature=snapshot.step_signature,
         )
     if any(text in snapshot.status_text for text in FAILURE_STATUS_TEXTS):
         return ExtensionRunResult(
@@ -373,6 +375,7 @@ def classify_extension_snapshot(
             recent_logs=snapshot.recent_logs,
             current_email=current_email,
             saw_current_email_log=saw_current_email_log,
+            step_signature=snapshot.step_signature,
         )
     if stagnant_seconds >= RUN_MONITOR_STAGNATION_TIMEOUT_SECONDS:
         status_text = snapshot.status_text or "状态长期无变化"
@@ -383,6 +386,7 @@ def classify_extension_snapshot(
             recent_logs=snapshot.recent_logs,
             current_email=current_email,
             saw_current_email_log=saw_current_email_log,
+            step_signature=snapshot.step_signature,
         )
     return None
 
@@ -403,6 +407,7 @@ def build_attempt_timeout_result(
     recent_logs: tuple[str, ...] = (),
     current_email: str = "",
     saw_current_email_log: bool = False,
+    step_signature: tuple[str, ...] = (),
 ) -> ExtensionRunResult:
     return ExtensionRunResult(
         "attempt_timeout",
@@ -411,6 +416,7 @@ def build_attempt_timeout_result(
         recent_logs=recent_logs,
         current_email=current_email,
         saw_current_email_log=saw_current_email_log,
+        step_signature=step_signature,
     )
 
 
@@ -486,6 +492,7 @@ def monitor_extension_run(
                     recent_logs=last_snapshot.recent_logs,
                     current_email=current_email,
                     saw_current_email_log=saw_current_email_log,
+                    step_signature=last_snapshot.step_signature,
                 )
             sleep_seconds = RUN_MONITOR_POLL_INTERVAL_SECONDS
             if max_attempt_seconds is not None:
@@ -499,6 +506,7 @@ def monitor_extension_run(
                         recent_logs=last_snapshot.recent_logs,
                         current_email=current_email,
                         saw_current_email_log=saw_current_email_log,
+                        step_signature=last_snapshot.step_signature,
                     )
                 sleep_seconds = min(sleep_seconds, remaining_seconds)
             time.sleep(sleep_seconds)
@@ -532,6 +540,7 @@ def monitor_extension_run(
                 recent_logs=last_snapshot.recent_logs,
                 current_email=current_email,
                 saw_current_email_log=saw_current_email_log,
+                step_signature=last_snapshot.step_signature,
             )
         raise
 

@@ -12,11 +12,17 @@ from pathlib import Path
 
 from chrome_runner.add_phone_failure import (
     build_failed_add_phone_emails_file_path,
+    build_failed_signup_emails_file_path,
     load_failed_add_phone_emails,
+    load_failed_signup_emails,
     parse_failed_add_phone_profile_name,
+    parse_failed_signup_profile_name,
     record_failed_add_phone_email_retry,
     record_failed_add_phone_email,
+    record_failed_signup_email_retry,
+    record_failed_signup_email,
     remove_failed_add_phone_email,
+    remove_failed_signup_email,
 )
 from chrome_runner.chrome import (
     build_command,
@@ -104,6 +110,35 @@ INTERRUPTED_MESSAGE = "已中断当前运行。"
 INIT_PROFILE_SCRIPT_NAME = "init_chrome_profile.py"
 MISSING_PROFILE_MESSAGE = "缺少基准 profile 目录"
 FAILED_EMAIL_RECORD_OUTCOMES = frozenset({"failure", "timeout", "attempt_timeout"})
+FAILED_EMAIL_RETRY_KIND_NONE = ""
+FAILED_EMAIL_RETRY_KIND_OAUTH = "oauth"
+FAILED_EMAIL_RETRY_KIND_SIGNUP = "signup"
+FAILED_EMAIL_RETRY_KIND_PRIORITY = (
+    FAILED_EMAIL_RETRY_KIND_OAUTH,
+    FAILED_EMAIL_RETRY_KIND_SIGNUP,
+)
+FAILED_EMAIL_RETRY_SIGNUP_STAGE_START_STEP = 4
+FAILED_EMAIL_RETRY_OAUTH_STAGE_START_STEP = 6
+STEP_STATUS_PENDING = "pending"
+STEP_STATUS_CHOICES = frozenset(
+    {
+        STEP_STATUS_PENDING,
+        "running",
+        "completed",
+        "failed",
+        "stopped",
+        "manual_completed",
+        "skipped",
+    }
+)
+FAILED_EMAIL_RETRY_REACHED_STEP_STATUSES = frozenset(
+    {
+        "running",
+        "completed",
+        "failed",
+        "manual_completed",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -116,6 +151,7 @@ class RunAttemptResult:
     summary_text: str
     profile_name: str = ""
     start_mode: str = EXTENSION_START_MODE_AUTO_RUN
+    retry_kind: str = FAILED_EMAIL_RETRY_KIND_NONE
 
     @property
     def succeeded(self) -> bool:
@@ -132,6 +168,7 @@ class SingleRunResult:
     selected_proxy_delay_ms: int | None = None
     should_blacklist_selected_proxy: bool = False
     selected_proxy_failure_recorded: bool = False
+    failed_email_retry_kind: str = FAILED_EMAIL_RETRY_KIND_NONE
 
     @property
     def succeeded(self) -> bool:
@@ -163,6 +200,7 @@ class BatchAttemptRequest:
     forced_profile_name: str = ""
     emails_file_path: Path | None = None
     pending_registration_emails: tuple[str, ...] = ()
+    retry_kind: str = FAILED_EMAIL_RETRY_KIND_NONE
 
 
 @dataclass(frozen=True)
@@ -328,8 +366,8 @@ def parse_args() -> argparse.Namespace:
         type=parse_positive_int,
         default=DEFAULT_FAILED_ADD_PHONE_EMAIL_MAX_RETRIES,
         help=(
-            "失败邮箱重跑模式下，单个邮箱连续失败达到该次数后"
-            "会从失败邮箱文件移除。"
+            "内部保留邮箱重跑模式下，单个邮箱连续失败达到该次数后"
+            "会从对应重跑队列移除。"
             f"默认 {DEFAULT_FAILED_ADD_PHONE_EMAIL_MAX_RETRIES}。"
         ),
     )
@@ -446,14 +484,14 @@ def resolve_emails_file_profile_names(
     args: argparse.Namespace,
     profile_names: Sequence[str],
 ) -> tuple[str, ...]:
-    emails_file_path = build_emails_file_path(args)
-    if emails_file_path is None:
-        return tuple(profile_names)
-    parsed_profile_name = parse_failed_add_phone_profile_name(emails_file_path)
+    retry_kind, parsed_profile_name = resolve_failed_retry_context_from_emails_file(
+        build_emails_file_path(args)
+    )
     if parsed_profile_name is None:
         return tuple(profile_names)
     print(
-        "邮箱文件模式：从失败邮箱文件名解析出 profile："
+        "邮箱文件模式：从"
+        f"{describe_failed_email_retry_kind(retry_kind)}队列文件名解析出 profile："
         f"{parsed_profile_name}"
     )
     return (parsed_profile_name,)
@@ -556,6 +594,219 @@ def has_any_signal_text(messages: Collection[str], signal_texts: Collection[str]
     )
 
 
+def describe_failed_email_retry_kind(retry_kind: str) -> str:
+    if retry_kind == FAILED_EMAIL_RETRY_KIND_OAUTH:
+        return "OAuth 重跑"
+    if retry_kind == FAILED_EMAIL_RETRY_KIND_SIGNUP:
+        return "注册重跑"
+    return "失败邮箱重跑"
+
+
+def resolve_failed_retry_context_from_emails_file(
+    emails_file_path: Path | None,
+) -> tuple[str, str | None]:
+    if emails_file_path is None:
+        return FAILED_EMAIL_RETRY_KIND_NONE, None
+    parsed_profile_name = parse_failed_add_phone_profile_name(emails_file_path)
+    if parsed_profile_name is not None:
+        return FAILED_EMAIL_RETRY_KIND_OAUTH, parsed_profile_name
+    parsed_profile_name = parse_failed_signup_profile_name(emails_file_path)
+    if parsed_profile_name is not None:
+        return FAILED_EMAIL_RETRY_KIND_SIGNUP, parsed_profile_name
+    return FAILED_EMAIL_RETRY_KIND_NONE, None
+
+
+def build_failed_retry_emails_file_path(
+    retry_kind: str,
+    base_dir: Path,
+    profile_name: str,
+) -> Path:
+    if retry_kind == FAILED_EMAIL_RETRY_KIND_OAUTH:
+        return build_failed_add_phone_emails_file_path(base_dir, profile_name)
+    if retry_kind == FAILED_EMAIL_RETRY_KIND_SIGNUP:
+        return build_failed_signup_emails_file_path(base_dir, profile_name)
+    raise RuntimeError(f"未知失败邮箱重跑类型: {retry_kind}")
+
+
+def load_failed_retry_emails(
+    retry_kind: str,
+    base_dir: Path,
+    profile_name: str,
+) -> tuple[str, ...]:
+    if retry_kind == FAILED_EMAIL_RETRY_KIND_OAUTH:
+        return load_failed_add_phone_emails(base_dir, profile_name)
+    if retry_kind == FAILED_EMAIL_RETRY_KIND_SIGNUP:
+        return load_failed_signup_emails(base_dir, profile_name)
+    raise RuntimeError(f"未知失败邮箱重跑类型: {retry_kind}")
+
+
+def remove_failed_retry_email(
+    retry_kind: str,
+    base_dir: Path,
+    profile_name: str,
+    email: str,
+) -> tuple[str, ...]:
+    if retry_kind == FAILED_EMAIL_RETRY_KIND_OAUTH:
+        return remove_failed_add_phone_email(base_dir, profile_name, email)
+    if retry_kind == FAILED_EMAIL_RETRY_KIND_SIGNUP:
+        return remove_failed_signup_email(base_dir, profile_name, email)
+    raise RuntimeError(f"未知失败邮箱重跑类型: {retry_kind}")
+
+
+def record_failed_retry_email(
+    retry_kind: str,
+    base_dir: Path,
+    profile_name: str,
+    email: str,
+) -> bool:
+    if retry_kind == FAILED_EMAIL_RETRY_KIND_OAUTH:
+        return record_failed_add_phone_email(base_dir, profile_name, email)
+    if retry_kind == FAILED_EMAIL_RETRY_KIND_SIGNUP:
+        return record_failed_signup_email(base_dir, profile_name, email)
+    raise RuntimeError(f"未知失败邮箱重跑类型: {retry_kind}")
+
+
+def record_failed_retry_email_retry(
+    retry_kind: str,
+    base_dir: Path,
+    profile_name: str,
+    email: str,
+    *,
+    max_retry_count: int,
+):
+    if retry_kind == FAILED_EMAIL_RETRY_KIND_OAUTH:
+        return record_failed_add_phone_email_retry(
+            base_dir,
+            profile_name,
+            email,
+            max_retry_count=max_retry_count,
+        )
+    if retry_kind == FAILED_EMAIL_RETRY_KIND_SIGNUP:
+        return record_failed_signup_email_retry(
+            base_dir,
+            profile_name,
+            email,
+            max_retry_count=max_retry_count,
+        )
+    raise RuntimeError(f"未知失败邮箱重跑类型: {retry_kind}")
+
+
+def remove_failed_retry_email_from_other_queues(
+    base_dir: Path,
+    *,
+    profile_name: str,
+    email: str,
+    keep_retry_kind: str,
+) -> tuple[str, ...]:
+    normalized_email_key = email.strip().casefold()
+    removed_retry_kinds: list[str] = []
+    for retry_kind in FAILED_EMAIL_RETRY_KIND_PRIORITY:
+        if retry_kind == keep_retry_kind:
+            continue
+        if normalized_email_key not in {
+            item.casefold()
+            for item in load_failed_retry_emails(retry_kind, base_dir, profile_name)
+        }:
+            continue
+        remove_failed_retry_email(retry_kind, base_dir, profile_name, email)
+        removed_retry_kinds.append(retry_kind)
+    return tuple(removed_retry_kinds)
+
+
+def remove_failed_retry_email_from_all_queues(
+    base_dir: Path,
+    *,
+    profile_name: str,
+    email: str,
+) -> tuple[str, ...]:
+    return remove_failed_retry_email_from_other_queues(
+        base_dir,
+        profile_name=profile_name,
+        email=email,
+        keep_retry_kind=FAILED_EMAIL_RETRY_KIND_NONE,
+    )
+
+
+def remove_failed_retry_email_if_present(
+    retry_kind: str,
+    base_dir: Path,
+    *,
+    profile_name: str,
+    email: str,
+) -> tuple[bool, tuple[str, ...]]:
+    pending_emails = load_failed_retry_emails(retry_kind, base_dir, profile_name)
+    normalized_email_key = email.strip().casefold()
+    if normalized_email_key not in {item.casefold() for item in pending_emails}:
+        return False, pending_emails
+    return True, remove_failed_retry_email(
+        retry_kind,
+        base_dir,
+        profile_name,
+        email,
+    )
+
+
+def parse_step_status_from_row_class(row_class: str) -> str:
+    class_names = str(row_class).split()
+    for class_name in reversed(class_names):
+        if class_name in STEP_STATUS_CHOICES:
+            return class_name
+    return STEP_STATUS_PENDING
+
+
+def iter_extension_step_statuses(
+    step_signature: Collection[str],
+):
+    for signature_item in step_signature:
+        raw_step, separator, remainder = signature_item.partition("|")
+        if not separator:
+            continue
+        row_class, separator, _ = remainder.partition("|")
+        if not separator:
+            continue
+        try:
+            step = int(raw_step.strip())
+        except ValueError:
+            continue
+        yield step, parse_step_status_from_row_class(row_class)
+
+
+def has_reached_failed_email_retry_stage(
+    result: ExtensionRunResult,
+    *,
+    start_step: int,
+) -> bool:
+    return any(
+        step >= start_step
+        and step_status in FAILED_EMAIL_RETRY_REACHED_STEP_STATUSES
+        for step, step_status in iter_extension_step_statuses(result.step_signature)
+    )
+
+
+def did_reach_failed_email_retry_stage(result: ExtensionRunResult) -> bool:
+    if has_any_signal_text(
+        build_extension_result_messages(result),
+        ADD_PHONE_ERROR_SIGNAL_TEXTS,
+    ):
+        return True
+    return has_reached_failed_email_retry_stage(
+        result,
+        start_step=FAILED_EMAIL_RETRY_SIGNUP_STAGE_START_STEP,
+    )
+
+
+def did_reach_failed_email_oauth_retry_stage(result: ExtensionRunResult) -> bool:
+    if has_any_signal_text(
+        build_extension_result_messages(result),
+        ADD_PHONE_ERROR_SIGNAL_TEXTS,
+    ):
+        return True
+    return has_reached_failed_email_retry_stage(
+        result,
+        start_step=FAILED_EMAIL_RETRY_OAUTH_STAGE_START_STEP,
+    )
+
+
 def did_hit_add_phone_failure(result: ExtensionRunResult) -> bool:
     if result.outcome != "failure":
         return False
@@ -568,8 +819,19 @@ def did_hit_add_phone_failure(result: ExtensionRunResult) -> bool:
 def should_record_failed_email_for_result(result: ExtensionRunResult) -> bool:
     return (
         result.outcome in FAILED_EMAIL_RECORD_OUTCOMES
-        and result.saw_current_email_log
+        and bool(result.current_email)
+        and did_reach_failed_email_retry_stage(result)
     )
+
+
+def resolve_failed_email_retry_kind_for_result(
+    result: ExtensionRunResult,
+) -> str:
+    if not should_record_failed_email_for_result(result):
+        return FAILED_EMAIL_RETRY_KIND_NONE
+    if did_reach_failed_email_oauth_retry_stage(result):
+        return FAILED_EMAIL_RETRY_KIND_OAUTH
+    return FAILED_EMAIL_RETRY_KIND_SIGNUP
 
 
 def should_blacklist_profile_for_mailbox_signal(
@@ -647,27 +909,52 @@ def maybe_record_selected_proxy_blacklist(
     )
 
 
-def maybe_record_failed_add_phone_email(
+def maybe_record_failed_retry_email(
     base_dir: Path,
     *,
     profile_name: str,
-    failed_email: str,
-    should_record_failed_email: bool,
-) -> None:
-    if not should_record_failed_email:
-        return
+    result: ExtensionRunResult,
+) -> str:
+    retry_kind = resolve_failed_email_retry_kind_for_result(result)
+    if not retry_kind:
+        return FAILED_EMAIL_RETRY_KIND_NONE
+
+    failed_email = result.current_email
     if not failed_email:
         print("自动运行前置：本轮未成功，但日志里没有提取到当前邮箱。")
-        return
-    is_new_entry = record_failed_add_phone_email(
+        return FAILED_EMAIL_RETRY_KIND_NONE
+
+    queue_label = describe_failed_email_retry_kind(retry_kind)
+    removed_retry_kinds = remove_failed_retry_email_from_other_queues(
+        base_dir,
+        profile_name=profile_name,
+        email=failed_email,
+        keep_retry_kind=retry_kind,
+    )
+    if removed_retry_kinds:
+        removed_labels = "、".join(
+            describe_failed_email_retry_kind(item)
+            for item in removed_retry_kinds
+        )
+        print(
+            f"自动运行前置：邮箱 {failed_email} 已从 {removed_labels} 队列移出，"
+            f"改写入 {queue_label} 队列。"
+        )
+
+    is_new_entry = record_failed_retry_email(
+        retry_kind,
         base_dir,
         profile_name,
         failed_email,
     )
     if is_new_entry:
-        print(f"自动运行前置：未成功邮箱已写入文件：{failed_email}")
-        return
-    print(f"自动运行前置：未成功邮箱已存在，跳过重复写入：{failed_email}")
+        print(f"自动运行前置：{queue_label}邮箱已写入文件：{failed_email}")
+        return retry_kind
+    print(
+        f"自动运行前置：{queue_label}邮箱已存在，跳过重复写入："
+        f"{failed_email}"
+    )
+    return retry_kind
 
 
 def maybe_record_profile_blacklist(
@@ -1030,6 +1317,7 @@ def execute_single_run(
     selected_proxy_delay_ms: int | None = None
     should_blacklist_selected_proxy = False
     selected_proxy_failure_recorded = False
+    failed_email_retry_kind = FAILED_EMAIL_RETRY_KIND_NONE
 
     try:
         if not base_profile_dir.is_dir():
@@ -1114,13 +1402,10 @@ def execute_single_run(
                 proxy_name=selected_proxy_name,
                 should_blacklist_proxy=should_blacklist_selected_proxy,
             )
-            maybe_record_failed_add_phone_email(
+            failed_email_retry_kind = maybe_record_failed_retry_email(
                 base_dir,
                 profile_name=profile_name,
-                failed_email=result.current_email,
-                should_record_failed_email=should_record_failed_email_for_result(
-                    result
-                ),
+                result=result,
             )
             maybe_record_profile_blacklist(
                 base_dir,
@@ -1165,6 +1450,7 @@ def execute_single_run(
         selected_proxy_delay_ms=selected_proxy_delay_ms,
         should_blacklist_selected_proxy=should_blacklist_selected_proxy,
         selected_proxy_failure_recorded=selected_proxy_failure_recorded,
+        failed_email_retry_kind=failed_email_retry_kind,
     )
 
 
@@ -1231,15 +1517,29 @@ def print_batch_summary(
     total_duration_seconds: float,
 ) -> None:
     total_runs = len(results)
-    auto_run_count = sum(
+    oauth_retry_run_count = sum(
         1
         for result in results
-        if result.start_mode == EXTENSION_START_MODE_AUTO_RUN
+        if result.retry_kind == FAILED_EMAIL_RETRY_KIND_OAUTH
     )
-    retry_run_count = sum(
+    signup_retry_run_count = sum(
         1
         for result in results
-        if result.start_mode == EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY
+        if result.retry_kind == FAILED_EMAIL_RETRY_KIND_SIGNUP
+    )
+    new_account_run_count = sum(
+        1
+        for result in results
+        if (
+            result.start_mode == EXTENSION_START_MODE_AUTO_RUN
+            and not result.retry_kind
+        )
+    )
+    other_mode_run_count = (
+        total_runs
+        - new_account_run_count
+        - oauth_retry_run_count
+        - signup_retry_run_count
     )
     success_count = sum(1 for result in results if result.succeeded)
     failure_results = [result for result in results if not result.succeeded]
@@ -1249,8 +1549,11 @@ def print_batch_summary(
 
     print("批量运行汇总：")
     print(f"总轮数: {total_runs}")
-    print(f"新号轮次: {auto_run_count}")
-    print(f"失败邮箱重跑轮次: {retry_run_count}")
+    print(f"新号轮次: {new_account_run_count}")
+    print(f"OAuth 重跑轮次: {oauth_retry_run_count}")
+    print(f"注册重跑轮次: {signup_retry_run_count}")
+    if other_mode_run_count:
+        print(f"其他启动模式轮次: {other_mode_run_count}")
     print(f"成功次数: {success_count}")
     print(f"失败次数: {failure_count}")
     print(f"成功率: {success_rate:.1f}%")
@@ -1270,11 +1573,20 @@ def build_emails_file_attempt_request(
     registration_email: str,
     pending_registration_emails: list[str],
 ) -> BatchAttemptRequest:
+    emails_file_path = build_emails_file_path(args)
+    retry_kind, forced_profile_name = resolve_failed_retry_context_from_emails_file(
+        emails_file_path
+    )
+    start_mode = args.extension_start_mode
+    if retry_kind:
+        start_mode = resolve_failed_email_retry_start_mode(retry_kind)
     return BatchAttemptRequest(
-        start_mode=args.extension_start_mode,
+        start_mode=start_mode,
         registration_email=registration_email,
-        emails_file_path=build_emails_file_path(args),
+        forced_profile_name=forced_profile_name or "",
+        emails_file_path=emails_file_path,
         pending_registration_emails=tuple(pending_registration_emails),
+        retry_kind=retry_kind,
     )
 
 
@@ -1292,28 +1604,87 @@ def should_attempt_failed_email_retry(
     return not should_switch_proxy_for_batch_attempt(args, proxy_state)
 
 
+def resolve_failed_email_retry_start_mode(retry_kind: str) -> str:
+    if retry_kind == FAILED_EMAIL_RETRY_KIND_OAUTH:
+        return EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY
+    if retry_kind == FAILED_EMAIL_RETRY_KIND_SIGNUP:
+        return EXTENSION_START_MODE_AUTO_RUN
+    raise RuntimeError(f"未知失败邮箱重跑类型: {retry_kind}")
+
+
 def build_failed_email_retry_request(
     base_dir: Path,
     *,
     profile_name: str,
 ) -> BatchAttemptRequest | None:
-    pending_emails = load_failed_add_phone_emails(base_dir, profile_name)
-    if not pending_emails:
-        return None
-    return BatchAttemptRequest(
-        start_mode=EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY,
-        registration_email=pending_emails[0],
-        forced_profile_name=profile_name,
-        emails_file_path=build_failed_add_phone_emails_file_path(base_dir, profile_name),
-        pending_registration_emails=pending_emails,
-    )
+    for retry_kind in FAILED_EMAIL_RETRY_KIND_PRIORITY:
+        pending_emails = load_failed_retry_emails(retry_kind, base_dir, profile_name)
+        if not pending_emails:
+            continue
+        return BatchAttemptRequest(
+            start_mode=resolve_failed_email_retry_start_mode(retry_kind),
+            registration_email=pending_emails[0],
+            forced_profile_name=profile_name,
+            emails_file_path=build_failed_retry_emails_file_path(
+                retry_kind,
+                base_dir,
+                profile_name,
+            ),
+            pending_registration_emails=pending_emails,
+            retry_kind=retry_kind,
+        )
+    return None
 
 
-def is_failed_add_phone_retry_attempt(attempt_request: BatchAttemptRequest) -> bool:
-    return bool(
-        attempt_request.start_mode == EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY
-        and attempt_request.forced_profile_name
-    )
+def build_failed_retry_attempt_requests(
+    base_dir: Path,
+    *,
+    profile_name: str,
+) -> tuple[BatchAttemptRequest, ...]:
+    attempt_requests: list[BatchAttemptRequest] = []
+    seen_email_keys: set[str] = set()
+    for retry_kind in FAILED_EMAIL_RETRY_KIND_PRIORITY:
+        pending_emails = load_failed_retry_emails(retry_kind, base_dir, profile_name)
+        for registration_email in pending_emails:
+            email_key = registration_email.casefold()
+            if email_key in seen_email_keys:
+                continue
+            seen_email_keys.add(email_key)
+            attempt_requests.append(
+                BatchAttemptRequest(
+                    start_mode=resolve_failed_email_retry_start_mode(retry_kind),
+                    registration_email=registration_email,
+                    forced_profile_name=profile_name,
+                    emails_file_path=build_failed_retry_emails_file_path(
+                        retry_kind,
+                        base_dir,
+                        profile_name,
+                    ),
+                    pending_registration_emails=pending_emails,
+                    retry_kind=retry_kind,
+                )
+            )
+    return tuple(attempt_requests)
+
+
+def count_failed_retry_pending_emails(
+    base_dir: Path,
+    *,
+    profile_name: str,
+) -> int:
+    unique_email_keys: set[str] = set()
+    for retry_kind in FAILED_EMAIL_RETRY_KIND_PRIORITY:
+        for registration_email in load_failed_retry_emails(
+            retry_kind,
+            base_dir,
+            profile_name,
+        ):
+            unique_email_keys.add(registration_email.casefold())
+    return len(unique_email_keys)
+
+
+def is_failed_email_retry_attempt(attempt_request: BatchAttemptRequest) -> bool:
+    return bool(attempt_request.retry_kind and attempt_request.forced_profile_name)
 
 
 def execute_batch_attempt(
@@ -1340,6 +1711,11 @@ def execute_batch_attempt(
     print(f"本轮基准 profile: {profile_name}")
     if attempt_request.start_mode != EXTENSION_START_MODE_AUTO_RUN:
         print(f"本轮启动模式: {attempt_request.start_mode}")
+    if attempt_request.retry_kind:
+        print(
+            "本轮重跑类型: "
+            f"{describe_failed_email_retry_kind(attempt_request.retry_kind)}"
+        )
     if attempt_request.registration_email:
         print(f"本轮指定邮箱: {attempt_request.registration_email}")
     attempt_started_at = time.perf_counter()
@@ -1368,24 +1744,43 @@ def execute_batch_attempt(
         single_run_result,
     )
     pending_registration_emails = list(attempt_request.pending_registration_emails)
+    result_retry_kind = attempt_request.retry_kind
     if (
         attempt_request.registration_email
         and single_run_result.succeeded
         and attempt_request.emails_file_path is not None
     ):
         try:
-            if is_failed_add_phone_retry_attempt(attempt_request):
-                pending_registration_emails = list(
-                    remove_failed_add_phone_email(
-                        base_dir,
-                        attempt_request.forced_profile_name,
-                        attempt_request.registration_email,
-                    )
+            if is_failed_email_retry_attempt(attempt_request):
+                queue_label = describe_failed_email_retry_kind(
+                    attempt_request.retry_kind
+                )
+                _, next_pending_emails = remove_failed_retry_email_if_present(
+                    attempt_request.retry_kind,
+                    base_dir,
+                    profile_name=attempt_request.forced_profile_name,
+                    email=attempt_request.registration_email,
+                )
+                pending_registration_emails = list(next_pending_emails)
+                removed_retry_kinds = remove_failed_retry_email_from_all_queues(
+                    base_dir,
+                    profile_name=attempt_request.forced_profile_name,
+                    email=attempt_request.registration_email,
                 )
                 print(
-                    f"失败邮箱文件已移除成功邮箱：{attempt_request.registration_email}；"
+                    f"{queue_label}队列已移除成功邮箱："
+                    f"{attempt_request.registration_email}；"
                     f"剩余 {len(pending_registration_emails)} 个邮箱。"
                 )
+                if removed_retry_kinds:
+                    removed_labels = "、".join(
+                        describe_failed_email_retry_kind(item)
+                        for item in removed_retry_kinds
+                    )
+                    print(
+                        f"自动运行前置：成功邮箱已同步从 {removed_labels} 队列移除："
+                        f"{attempt_request.registration_email}"
+                    )
             else:
                 pending_registration_emails = persist_successful_email_removal(
                     attempt_request.emails_file_path,
@@ -1408,37 +1803,63 @@ def execute_batch_attempt(
                 selected_proxy_failure_recorded=(
                     single_run_result.selected_proxy_failure_recorded
                 ),
+                failed_email_retry_kind=single_run_result.failed_email_retry_kind,
             )
     elif (
         attempt_request.registration_email
         and not single_run_result.succeeded
-        and is_failed_add_phone_retry_attempt(attempt_request)
+        and is_failed_email_retry_attempt(attempt_request)
     ):
         try:
-            retry_result = record_failed_add_phone_email_retry(
+            retry_kind = (
+                single_run_result.failed_email_retry_kind
+                or attempt_request.retry_kind
+            )
+            result_retry_kind = retry_kind
+            retry_result = record_failed_retry_email_retry(
+                retry_kind,
                 base_dir,
                 attempt_request.forced_profile_name,
                 attempt_request.registration_email,
                 max_retry_count=args.failed_add_phone_email_max_retries,
             )
+            queue_label = describe_failed_email_retry_kind(retry_kind)
+            pending_registration_emails = list(
+                load_failed_retry_emails(
+                    retry_kind,
+                    base_dir,
+                    attempt_request.forced_profile_name,
+                )
+            )
             if retry_result.did_remove_email:
+                removed_retry_kinds = remove_failed_retry_email_from_other_queues(
+                    base_dir,
+                    profile_name=attempt_request.forced_profile_name,
+                    email=attempt_request.registration_email,
+                    keep_retry_kind=retry_kind,
+                )
                 print(
-                    "失败邮箱重跑：邮箱 "
+                    f"{queue_label}：邮箱 "
                     f"{attempt_request.registration_email} 已连续失败 "
-                    f"{retry_result.retry_count} 次，已从失败邮箱文件移除；"
+                    f"{retry_result.retry_count} 次，已从队列移除；"
                     f"剩余 {retry_result.remaining_email_count} 个邮箱。"
                 )
-                pending_registration_emails = remove_email_from_pending_list(
-                    pending_registration_emails,
-                    attempt_request.registration_email,
-                )
+                if removed_retry_kinds:
+                    removed_labels = "、".join(
+                        describe_failed_email_retry_kind(item)
+                        for item in removed_retry_kinds
+                    )
+                    print(
+                        f"自动运行前置：达到重试上限的邮箱已同步从 {removed_labels} 队列移除："
+                        f"{attempt_request.registration_email}"
+                    )
             else:
                 print(
-                    "失败邮箱重跑：邮箱 "
+                    f"{queue_label}：邮箱 "
                     f"{attempt_request.registration_email} 已连续失败 "
                     f"{retry_result.retry_count}/"
                     f"{args.failed_add_phone_email_max_retries} 次，"
-                    "保留在失败邮箱文件中。"
+                    "保留在队列中。"
                 )
         except Exception as exc:  # noqa: BLE001
             single_run_result = SingleRunResult(
@@ -1455,6 +1876,7 @@ def execute_batch_attempt(
                 selected_proxy_failure_recorded=(
                     single_run_result.selected_proxy_failure_recorded
                 ),
+                failed_email_retry_kind=single_run_result.failed_email_retry_kind,
             )
     update_batch_proxy_state(proxy_state, single_run_result)
     duration_seconds = time.perf_counter() - attempt_started_at
@@ -1465,6 +1887,7 @@ def execute_batch_attempt(
         summary_text=single_run_result.summary_text,
         profile_name=profile_name,
         start_mode=attempt_request.start_mode,
+        retry_kind=result_retry_kind,
     )
     print_attempt_result(result, total_runs)
     return result, pending_registration_emails
@@ -1483,6 +1906,65 @@ def run_batch(
     profile_state = BatchProfileState()
     if batch_registration_emails:
         total_rounds = resolve_emails_file_total_rounds(args)
+        emails_file_retry_kind, emails_file_profile_name = (
+            resolve_failed_retry_context_from_emails_file(build_emails_file_path(args))
+        )
+        if emails_file_retry_kind and emails_file_profile_name:
+            pending_email_count = count_failed_retry_pending_emails(
+                base_dir,
+                profile_name=emails_file_profile_name,
+            )
+            print(
+                "邮箱文件模式：检测到"
+                f"{describe_failed_email_retry_kind(emails_file_retry_kind)}队列文件；"
+                f"当前总共 {pending_email_count} 个内部重跑邮箱；"
+                f"首轮后额外继续跑剩余邮箱 {total_rounds - 1} 轮。"
+            )
+            attempt_index = 0
+            for round_index in range(1, total_rounds + 1):
+                current_round_requests = build_failed_retry_attempt_requests(
+                    base_dir,
+                    profile_name=emails_file_profile_name,
+                )
+                if not current_round_requests:
+                    print(
+                        f"邮箱文件模式：第 {round_index}/{total_rounds} 轮开始前已无剩余邮箱，"
+                        "提前结束。"
+                    )
+                    break
+                print(
+                    f"邮箱文件模式：开始第 {round_index}/{total_rounds} 轮，"
+                    f"当前剩余 {len(current_round_requests)} 个邮箱。"
+                )
+                for attempt_request in current_round_requests:
+                    attempt_index += 1
+                    result, _ = execute_batch_attempt(
+                        args,
+                        base_dir,
+                        profile_names,
+                        attempt_request=attempt_request,
+                        attempt_index=attempt_index,
+                        total_runs=None,
+                        proxy_state=proxy_state,
+                        profile_state=profile_state,
+                    )
+                    results.append(result)
+                pending_email_count = count_failed_retry_pending_emails(
+                    base_dir,
+                    profile_name=emails_file_profile_name,
+                )
+                print(
+                    f"邮箱文件模式：第 {round_index}/{total_rounds} 轮结束，"
+                    f"剩余 {pending_email_count} 个邮箱。"
+                )
+            if pending_email_count:
+                print(
+                    f"邮箱文件模式：已达到最大轮数，仍剩 "
+                    f"{pending_email_count} 个邮箱待后续继续执行。"
+                )
+            total_duration_seconds = time.perf_counter() - batch_started_at
+            print_batch_summary(results, total_duration_seconds=total_duration_seconds)
+            return 0 if all(result.succeeded for result in results) else 1
         pending_registration_emails = list(batch_registration_emails)
         print(
             f"邮箱文件模式：首轮加载 {len(batch_registration_emails)} 个邮箱；"
@@ -1560,8 +2042,11 @@ def run_batch(
                         profile_name=previous_result.profile_name,
                     )
                     if attempt_request is not None:
+                        retry_label = describe_failed_email_retry_kind(
+                            attempt_request.retry_kind
+                        )
                         print(
-                            "失败邮箱重跑：继续复用当前节点，处理 "
+                            f"{retry_label}：继续复用当前节点，处理 "
                             f"profile {attempt_request.forced_profile_name} 的邮箱 "
                             f"{attempt_request.registration_email}。"
                         )
@@ -1570,11 +2055,13 @@ def run_batch(
                         break
                     if (
                         previous_result is not None
-                        and previous_result.start_mode
-                        == EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY
+                        and previous_result.retry_kind
                         and not previous_result.succeeded
                     ):
-                        print("失败邮箱重跑失败，切回新号模式。")
+                        print(
+                            f"{describe_failed_email_retry_kind(previous_result.retry_kind)}"
+                            "失败，切回新号模式。"
+                        )
                     remaining_auto_runs -= 1
                     attempt_request = build_auto_run_attempt_request()
                 attempt_index += 1
