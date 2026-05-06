@@ -300,6 +300,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--disable-auto-oauth-retry",
+        action="store_true",
+        help=(
+            "自动新号批量模式下，成功后复用当前节点时跳过 OAuth 重跑插队。"
+            "显式的 OAuth 邮箱文件重跑模式不受影响。"
+        ),
+    )
+    parser.add_argument(
         "--run-extension",
         action="store_true",
         help="启动复制出的 Chrome 后，等待扩展执行结束，再自动关闭浏览器并清理运行目录。",
@@ -1604,6 +1612,14 @@ def should_attempt_failed_email_retry(
     return not should_switch_proxy_for_batch_attempt(args, proxy_state)
 
 
+def resolve_auto_failed_email_retry_kinds(
+    args: argparse.Namespace,
+) -> tuple[str, ...]:
+    if getattr(args, "disable_auto_oauth_retry", False):
+        return (FAILED_EMAIL_RETRY_KIND_SIGNUP,)
+    return FAILED_EMAIL_RETRY_KIND_PRIORITY
+
+
 def resolve_failed_email_retry_start_mode(retry_kind: str) -> str:
     if retry_kind == FAILED_EMAIL_RETRY_KIND_OAUTH:
         return EXTENSION_START_MODE_REGISTERED_OAUTH_RETRY
@@ -1613,11 +1629,12 @@ def resolve_failed_email_retry_start_mode(retry_kind: str) -> str:
 
 
 def build_failed_email_retry_request(
+    args: argparse.Namespace,
     base_dir: Path,
     *,
     profile_name: str,
 ) -> BatchAttemptRequest | None:
-    for retry_kind in FAILED_EMAIL_RETRY_KIND_PRIORITY:
+    for retry_kind in resolve_auto_failed_email_retry_kinds(args):
         pending_emails = load_failed_retry_emails(retry_kind, base_dir, profile_name)
         if not pending_emails:
             continue
@@ -2038,6 +2055,7 @@ def run_batch(
                     previous_result,
                 ):
                     attempt_request = build_failed_email_retry_request(
+                        args,
                         base_dir,
                         profile_name=previous_result.profile_name,
                     )

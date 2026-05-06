@@ -89,6 +89,7 @@ run-2925-batch:
 		--run-extension \
 		--repeat-count $(BATCH_REPEAT_2925) \
 		--clash-ai-switch-strategy $(CLASH_AI_SWITCH_STRATEGY) \
+		--disable-auto-oauth-retry \
 		--clash-ai-switch-reuse-limit $(CLASH_AI_SWITCH_REUSE_LIMIT) \
 		--extension-id $(TARGET_EXTENSION_ID) \
 		--profile $(BASE_PROFILES_2925) \
